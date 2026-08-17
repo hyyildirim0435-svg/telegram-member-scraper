@@ -774,6 +774,7 @@ def main():
         },
         fallbacks=[CommandHandler("iptal", cancel)],
         allow_reentry=True,
+        per_message=False,
     )
 
     app.add_handler(conv_handler)
@@ -783,15 +784,25 @@ def main():
     asyncio.set_event_loop(loop)
 
     async def run_all():
+        # Start web server first for Render health check
         await run_web_server()
+        # Small delay to ensure port is bound
+        await asyncio.sleep(1)
         # Run bot with polling
         await app.initialize()
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         print("🤖 Bot başlatıldı!")
-        # Keep running
-        while True:
-            await asyncio.sleep(3600)
+        # Keep running forever
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
 
     try:
         loop.run_until_complete(run_all())
