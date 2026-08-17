@@ -62,6 +62,11 @@ class SourceRegressionTests(unittest.TestCase):
         self.assertIn("removed = state.sessions.pop(index)", SOURCE)
         self.assertIn("state.save_sessions()", SOURCE)
 
+    def test_message_scan_accepts_only_user_senders(self):
+        self.assertIn("sender = msg.sender", SOURCE)
+        self.assertIn("isinstance(sender, types.User)", SOURCE)
+        self.assertNotIn("msg.sender.bot", SOURCE)
+
     def test_stop_operation_is_scoped_to_chat_and_reports_count(self):
         self.assertIn("self.stop_events = {}", SOURCE)
         self.assertIn("def request_stop(self, chat_id):", SOURCE)

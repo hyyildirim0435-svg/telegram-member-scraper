@@ -761,9 +761,11 @@ async def scan_group_members(message, scan_type="messages"):
             msg_count = 0
             async for msg in client.iter_messages(group, limit=10000):
                 msg_count += 1
-                if msg.sender and hasattr(msg.sender, 'username'):
-                    if msg.sender.username and not msg.sender.bot:
-                        users.add(msg.sender.username)
+                sender = msg.sender
+                # Channel posts and service messages can expose a Channel/Chat
+                # sender; only Telegram User entities have a meaningful bot flag.
+                if isinstance(sender, types.User) and sender.username and not sender.bot:
+                    users.add(sender.username)
                 if len(users) >= MAX_USERS:
                     break
                 # Progress update every 1000 messages
