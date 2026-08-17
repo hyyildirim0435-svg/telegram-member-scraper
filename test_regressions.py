@@ -50,7 +50,9 @@ class SourceRegressionTests(unittest.TestCase):
     def test_persistent_encrypted_session_backup_is_configured(self):
         self.assertIn("SESSION_ENCRYPTION_KEY = os.getenv(\"SESSION_ENCRYPTION_KEY\", \"\")", SOURCE)
         self.assertIn("SESSION_BACKUP_FILE = \"sessions.enc\"", SOURCE)
+        self.assertIn("def _session_fernet():", SOURCE)
         self.assertIn("Fernet(SESSION_ENCRYPTION_KEY.encode(\"utf-8\"))", SOURCE)
+        self.assertIn("invalid SESSION_ENCRYPTION_KEY", SOURCE)
         self.assertIn("save_encrypted_sessions(self.sessions)", SOURCE)
 
     def test_account_listing_and_deletion_are_available(self):

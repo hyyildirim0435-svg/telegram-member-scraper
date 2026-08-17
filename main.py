@@ -40,6 +40,17 @@ SESSION_BACKUP_FILE = "sessions.enc"
 
 _persistence_lock = threading.Lock()
 
+
+def _session_fernet():
+    """Return a valid Fernet instance or disable encrypted backup safely."""
+    if not SESSION_ENCRYPTION_KEY:
+        return None
+    try:
+        return Fernet(SESSION_ENCRYPTION_KEY.encode("utf-8"))
+    except (ValueError, TypeError) as exc:
+        print(f"Encrypted session backup disabled: invalid SESSION_ENCRYPTION_KEY ({exc})")
+        return None
+
 # Data files
 SESSIONS_FILE = "sessions.json"
 ADDED_USERS_FILE = "added_users.json"
@@ -133,16 +144,19 @@ def save_to_github(filepath, data):
 
 def load_encrypted_sessions():
     """Load encrypted Telegram sessions from the durable GitHub backup."""
-    if not GITHUB_TOKEN or not SESSION_ENCRYPTION_KEY:
+    if not GITHUB_TOKEN:
         return None
     try:
+        fernet = _session_fernet()
+        if fernet is None:
+            return None
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{SESSION_BACKUP_FILE}"
         response = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=15)
         if response.status_code != 200:
             return None
         encoded = response.json().get("content", "").replace("\n", "")
         encrypted = base64.b64decode(encoded)
-        decrypted = Fernet(SESSION_ENCRYPTION_KEY.encode("utf-8")).decrypt(encrypted)
+        decrypted = fernet.decrypt(encrypted)
         data = json.loads(decrypted.decode("utf-8"))
         return data if isinstance(data, list) else None
     except InvalidToken:
@@ -155,11 +169,14 @@ def load_encrypted_sessions():
 
 def save_encrypted_sessions(data):
     """Persist session strings as an encrypted GitHub Contents file."""
-    if not GITHUB_TOKEN or not SESSION_ENCRYPTION_KEY:
-        print("Session backup skipped: GITHUB_TOKEN or SESSION_ENCRYPTION_KEY is missing.")
+    if not GITHUB_TOKEN:
+        print("Session backup skipped: GITHUB_TOKEN is missing.")
         return
     try:
-        encrypted = Fernet(SESSION_ENCRYPTION_KEY.encode("utf-8")).encrypt(
+        fernet = _session_fernet()
+        if fernet is None:
+            return
+        encrypted = fernet.encrypt(
             json.dumps(data, ensure_ascii=False).encode("utf-8")
         )
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{SESSION_BACKUP_FILE}"
