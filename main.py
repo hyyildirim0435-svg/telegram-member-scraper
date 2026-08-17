@@ -1,9 +1,7 @@
 import os
-import os
 import json
 import base64
 import asyncio
-import random
 import time
 import threading
 import requests
@@ -22,8 +20,6 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 AUTHORIZED_ADMIN_ID = 8302545787
 ADMIN_ID = int(os.getenv("ADMIN_ID", str(AUTHORIZED_ADMIN_ID)))
-# Keep authorization independent from deployment environment values: only this
-# explicitly approved Telegram user may operate the bot.
 ADMIN_IDS = [AUTHORIZED_ADMIN_ID]
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -33,9 +29,7 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "hyyildirim0435-svg/telegram-member-scraper")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-# Telethon StringSession values are secrets and must not be committed to GitHub.
 SESSIONS_JSON = os.getenv("SESSIONS_JSON", "")
-# Session strings are encrypted before being persisted to the GitHub backup.
 SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "")
 SESSION_BACKUP_FILE = "sessions.enc"
 
@@ -43,7 +37,6 @@ _persistence_lock = threading.Lock()
 
 
 def _session_fernet():
-    """Return a valid Fernet instance or disable encrypted backup safely."""
     if not SESSION_ENCRYPTION_KEY:
         return None
     try:
@@ -52,15 +45,15 @@ def _session_fernet():
         print(f"Encrypted session backup disabled: invalid SESSION_ENCRYPTION_KEY ({exc})")
         return None
 
+
 # Data files
 SESSIONS_FILE = "sessions.json"
-ADDED_USERS_FILE = "added_users.json"
+MESSAGED_USERS_FILE = "messaged_users.json"
 CONFIG_FILE = "config.json"
 
 # Conversation states
 (ADDING_PHONE, ADDING_CODE, ADDING_2FA,
- SETTING_SOURCE, SETTING_TARGET,
- SETTING_ADD_COUNT, CHOOSING_SCAN_TYPE) = range(7)
+ SETTING_SOURCE, SETTING_MESSAGE, SETTING_MSG_COUNT) = range(6)
 
 # Flask app for health check
 flask_app = Flask(__name__)
@@ -100,15 +93,13 @@ def telegram_webhook():
 
 
 def run_flask():
-    """Run Flask in a separate thread."""
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
 def keep_alive():
-    """Ping self every 10 minutes to prevent Render from sleeping."""
     url = RENDER_EXTERNAL_URL or f"http://localhost:{PORT}"
     while True:
-        time.sleep(600)  # 10 minutes
+        time.sleep(600)
         try:
             requests.get(f"{url}/health", timeout=10)
             print(f"[Keep-Alive] Ping sent at {datetime.now().strftime('%H:%M:%S')}")
@@ -140,7 +131,6 @@ def load_from_github(filepath):
 
 
 def save_to_github(filepath, data):
-    """Persist non-secret JSON state in the repository."""
     if not GITHUB_TOKEN or filepath == SESSIONS_FILE:
         return
     try:
@@ -167,7 +157,6 @@ def save_to_github(filepath, data):
 
 
 def load_encrypted_sessions():
-    """Load encrypted Telegram sessions from the durable GitHub backup."""
     if not GITHUB_TOKEN:
         return None
     try:
@@ -184,7 +173,7 @@ def load_encrypted_sessions():
         data = json.loads(decrypted.decode("utf-8"))
         return data if isinstance(data, list) else None
     except InvalidToken:
-        print("Encrypted session backup cannot be decrypted; falling back to SESSIONS_JSON/local data.")
+        print("Encrypted session backup cannot be decrypted; falling back.")
         return None
     except Exception as exc:
         print(f"Encrypted session load error: {exc}")
@@ -192,9 +181,7 @@ def load_encrypted_sessions():
 
 
 def save_encrypted_sessions(data):
-    """Persist session strings as an encrypted GitHub Contents file."""
     if not GITHUB_TOKEN:
-        print("Session backup skipped: GITHUB_TOKEN is missing.")
         return
     try:
         fernet = _session_fernet()
@@ -235,12 +222,11 @@ def load_json(filepath, default=None):
             except OSError:
                 pass
             return encrypted_sessions
-        # Bootstrap from the Render secret when no encrypted backup exists yet.
         if SESSIONS_JSON:
             try:
                 return json.loads(SESSIONS_JSON)
             except json.JSONDecodeError:
-                print("SESSIONS_JSON is not valid JSON; falling back to local sessions file.")
+                print("SESSIONS_JSON is not valid JSON; falling back.")
     remote_data = load_from_github(filepath)
     if remote_data is not None:
         try:
@@ -269,21 +255,17 @@ def is_admin(user_id):
 class BotState:
     def __init__(self):
         self.sessions = load_json(SESSIONS_FILE, [])
-        # Bootstrap the durable encrypted backup from the existing Render secret
-        # on the first startup after this feature is deployed.
         if self.sessions and SESSION_ENCRYPTION_KEY and not load_encrypted_sessions():
             save_encrypted_sessions(self.sessions)
-        self.added_users = load_json(ADDED_USERS_FILE, [])
+        self.messaged_users = load_json(MESSAGED_USERS_FILE, [])
         self.config = load_json(CONFIG_FILE, {
             "source_group": "",
-            "target_group": "",
+            "message_text": "",
             "scanned_users": []
         })
         self.temp_phone = None
         self.temp_client = None
         self.temp_phone_hash = None
-        # Each chat has an independent background operation. Keys are strings so
-        # the mapping remains safe if it is later persisted or logged as JSON.
         self.operations = {}
         self.stop_events = {}
 
@@ -312,8 +294,8 @@ class BotState:
             json.dump(self.sessions, f, indent=2, ensure_ascii=False)
         save_encrypted_sessions(self.sessions)
 
-    def save_added_users(self):
-        save_json(ADDED_USERS_FILE, self.added_users)
+    def save_messaged_users(self):
+        save_json(MESSAGED_USERS_FILE, self.messaged_users)
 
     def save_config(self):
         save_json(CONFIG_FILE, self.config)
@@ -331,21 +313,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📱 Hesap Ekle", callback_data="add_account")],
         [InlineKeyboardButton("📋 Hesapları Listele / Sil", callback_data="list_accounts")],
         [InlineKeyboardButton("🔗 Kaynak Grup Ayarla", callback_data="set_source")],
-        [InlineKeyboardButton("🎯 Hedef Grup Ayarla", callback_data="set_target")],
-        [InlineKeyboardButton("🔍 Tarama Başlat", callback_data="scan_start")],
-        [InlineKeyboardButton("➕ Üye Eklemeyi Başlat", callback_data="start_adding")],
-        [InlineKeyboardButton("⏹ Üye Eklemeyi Durdur", callback_data="stop_add")],
+        [InlineKeyboardButton("🔍 Üye Tara", callback_data="scan_start")],
+        [InlineKeyboardButton("✉️ Mesaj Ekle", callback_data="set_message")],
+        [InlineKeyboardButton("🚀 Mesaj Gönder", callback_data="start_messaging")],
+        [InlineKeyboardButton("⏹ Durdur", callback_data="stop_messaging")],
         [InlineKeyboardButton("📊 Durum", callback_data="status")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    msg_preview = state.config.get("message_text", "")
+    if msg_preview and len(msg_preview) > 50:
+        msg_preview = msg_preview[:50] + "..."
+
     text = (
-        "🤖 <b>Telegram Üye Çekme Botu</b>\n\n"
+        "🤖 <b>Telegram Mesaj Gönderme Botu</b>\n\n"
         f"📱 Kayıtlı Hesap: {len(state.sessions)}\n"
         f"🔗 Kaynak Grup: {state.config.get('source_group', 'Ayarlanmadı') or 'Ayarlanmadı'}\n"
-        f"🎯 Hedef Grup: {state.config.get('target_group', 'Ayarlanmadı') or 'Ayarlanmadı'}\n"
         f"👥 Taranan Kullanıcı: {len(state.config.get('scanned_users', []))}\n"
-        f"✅ Toplam Eklenen: {len(state.added_users)}\n"
+        f"✉️ Mesaj: {msg_preview or 'Ayarlanmadı'}\n"
+        f"✅ Mesaj Gönderilen: {len(state.messaged_users)}\n"
     )
 
     if update.callback_query:
@@ -353,24 +339,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
-    return ConversationHandler.END
-
-
-async def list_accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Bu botu kullanma yetkiniz yok.")
-        return ConversationHandler.END
-    if not state.sessions:
-        await update.message.reply_text("📋 Kayıtlı hesap yok.\n\n/start ile menüye dön.")
-        return ConversationHandler.END
-    text = "📋 <b>Kayıtlı Hesaplar</b>\n\nSilmek istediğiniz hesabın düğmesine basın:\n"
-    keyboard = []
-    for i, session_data in enumerate(state.sessions):
-        phone = session_data.get("phone", f"Hesap {i + 1}")
-        text += f"{i + 1}. {phone}\n"
-        keyboard.append([InlineKeyboardButton(f"🗑 {i + 1}. {phone} hesabını sil", callback_data=f"delete_account:{i}")])
-    keyboard.append([InlineKeyboardButton("🔙 Geri", callback_data="back_menu")])
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -429,36 +397,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    elif data == "stop_add":
-        if state.request_stop(query.message.chat_id):
-            await query.message.edit_text(
-                "⏹ <b>Durdurma isteği alındı.</b>\\n\\n"
-                "Mevcut Telegram isteği güvenli şekilde tamamlandıktan sonra işlem duracak ve rapor gönderilecek.",
-                parse_mode="HTML"
-            )
-        else:
-            await query.message.edit_text("ℹ️ Bu sohbette devam eden bir üye ekleme işlemi yok.\\n\\n/start ile menüye dön.")
-        return ConversationHandler.END
-
     elif data == "set_source":
         await query.message.edit_text(
             "🔗 <b>Kaynak Grup Ayarlama</b>\n\n"
-            "Üyelerin çekileceği grubun linkini girin:\n"
+            "Kullanıcıların taranacağı grubun linkini girin:\n"
             "Örnek: https://t.me/grupadi veya @grupadi\n\n"
             "/iptal yazarak iptal edebilirsiniz.",
             parse_mode="HTML"
         )
         return SETTING_SOURCE
 
-    elif data == "set_target":
+    elif data == "set_message":
         await query.message.edit_text(
-            "🎯 <b>Hedef Grup Ayarlama</b>\n\n"
-            "Üyelerin ekleneceği grubun linkini girin:\n"
-            "Örnek: https://t.me/grupadi veya @grupadi\n\n"
+            "✉️ <b>Mesaj Ayarlama</b>\n\n"
+            "Kullanıcılara gönderilecek mesajı yazın:\n\n"
             "/iptal yazarak iptal edebilirsiniz.",
             parse_mode="HTML"
         )
-        return SETTING_TARGET
+        return SETTING_MESSAGE
 
     elif data == "scan_start":
         if not state.config.get("source_group"):
@@ -469,14 +425,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         keyboard = [
-            [InlineKeyboardButton("👥 Tüm Üyeleri Çek", callback_data="scan_members")],
-            [InlineKeyboardButton("💬 Mesaj Atanları Çek", callback_data="scan_messages")],
+            [InlineKeyboardButton("👥 Tüm Üyeleri Tara", callback_data="scan_members")],
+            [InlineKeyboardButton("💬 Mesaj Atanları Tara", callback_data="scan_messages")],
             [InlineKeyboardButton("🔙 Geri", callback_data="back_menu")],
         ]
         await query.message.edit_text(
             "🔍 <b>Tarama Türü Seçin:</b>\n\n"
-            "👥 <b>Tüm Üyeleri Çek:</b> Gruptaki tüm üyeleri tarar\n"
-            "💬 <b>Mesaj Atanları Çek:</b> Grupta mesaj atan benzersiz kullanıcıları tarar",
+            "👥 <b>Tüm Üyeleri Tara:</b> Gruptaki tüm üyeleri tarar\n"
+            "💬 <b>Mesaj Atanları Tara:</b> Grupta mesaj atan benzersiz kullanıcıları tarar",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
@@ -492,39 +448,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(scan_group_members(query.message, scan_type="messages"))
         return ConversationHandler.END
 
-    elif data == "start_adding":
+    elif data == "start_messaging":
         if not state.config.get("scanned_users"):
             await query.message.edit_text("❌ Önce tarama yapın.\n\n/start ile menüye dön.")
             return ConversationHandler.END
-        if not state.config.get("target_group"):
-            await query.message.edit_text("❌ Önce hedef grup ayarlayın.\n\n/start ile menüye dön.")
+        if not state.config.get("message_text"):
+            await query.message.edit_text("❌ Önce mesaj ayarlayın.\n\n/start ile menüye dön.")
             return ConversationHandler.END
         if not state.sessions:
             await query.message.edit_text("❌ Önce en az bir hesap ekleyin.\n\n/start ile menüye dön.")
             return ConversationHandler.END
 
-        available = [u for u in state.config["scanned_users"] if u not in state.added_users]
+        available = [u for u in state.config["scanned_users"] if u not in state.messaged_users]
         await query.message.edit_text(
-            f"➕ <b>Üye Ekleme</b>\n\n"
+            f"🚀 <b>Mesaj Gönderme</b>\n\n"
             f"Toplam taranan: {len(state.config['scanned_users'])}\n"
-            f"Daha önce eklenen: {len(state.added_users)}\n"
-            f"Eklenebilir: {len(available)}\n\n"
-            f"Kaç kişi eklemek istiyorsunuz? (Sayı girin)\n\n"
+            f"Daha önce mesaj gönderilen: {len(state.messaged_users)}\n"
+            f"Mesaj gönderilebilir: {len(available)}\n\n"
+            f"Kaç kişiye mesaj göndermek istiyorsunuz? (Sayı girin)\n\n"
             f"/iptal yazarak iptal edebilirsiniz.",
             parse_mode="HTML"
         )
-        return SETTING_ADD_COUNT
+        return SETTING_MSG_COUNT
+
+    elif data == "stop_messaging":
+        if state.request_stop(query.message.chat_id):
+            await query.message.edit_text(
+                "⏹ <b>Durdurma isteği alındı.</b>\n\n"
+                "İşlem güvenli noktada duracak ve rapor gönderilecek.",
+                parse_mode="HTML"
+            )
+        else:
+            await query.message.edit_text("ℹ️ Devam eden bir mesaj gönderme işlemi yok.\n\n/start ile menüye dön.")
+        return ConversationHandler.END
 
     elif data == "status":
-        available = [u for u in state.config.get("scanned_users", []) if u not in state.added_users]
+        available = [u for u in state.config.get("scanned_users", []) if u not in state.messaged_users]
+        msg_preview = state.config.get("message_text", "")
+        if msg_preview and len(msg_preview) > 100:
+            msg_preview = msg_preview[:100] + "..."
         text = (
             "📊 <b>Durum Raporu</b>\n\n"
             f"📱 Kayıtlı Hesap: {len(state.sessions)}\n"
             f"🔗 Kaynak Grup: {state.config.get('source_group', 'Ayarlanmadı') or 'Ayarlanmadı'}\n"
-            f"🎯 Hedef Grup: {state.config.get('target_group', 'Ayarlanmadı') or 'Ayarlanmadı'}\n"
             f"👥 Taranan Kullanıcı: {len(state.config.get('scanned_users', []))}\n"
-            f"✅ Başarıyla Eklenen: {len(state.added_users)}\n"
-            f"⏳ Eklenebilir: {len(available)}\n"
+            f"✉️ Mesaj: {msg_preview or 'Ayarlanmadı'}\n"
+            f"✅ Mesaj Gönderilen: {len(state.messaged_users)}\n"
+            f"⏳ Gönderilebilir: {len(available)}\n"
             f"🔄 İşlem Durumu: {'Çalışıyor' if state.is_operation_running(query.message.chat_id) else 'Boşta'}\n"
             f"\n/start ile menüye dön."
         )
@@ -661,57 +631,55 @@ async def set_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = update.message.text.strip()
-    state.config["target_group"] = link
+async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg_text = update.message.text.strip()
+    state.config["message_text"] = msg_text
     state.save_config()
     await update.message.reply_text(
-        f"✅ Hedef grup ayarlandı: <b>{link}</b>\n\n/start ile menüye dön.",
+        f"✅ Mesaj ayarlandı:\n\n<i>{msg_text}</i>\n\n/start ile menüye dön.",
         parse_mode="HTML"
     )
     return ConversationHandler.END
 
 
-async def set_add_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_msg_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         count = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ Geçerli bir sayı girin:")
-        return SETTING_ADD_COUNT
+        return SETTING_MSG_COUNT
 
     chat_id = update.effective_chat.id
 
-    # Reserve per chat before yielding to the event loop. A second request from
-    # the same chat is rejected, while another chat can run independently.
     if state.is_operation_running(chat_id):
         await update.message.reply_text("⚠️ Zaten bir işlem devam ediyor.\n\n/start ile menüye dön.")
         return ConversationHandler.END
 
     if count <= 0:
         await update.message.reply_text("❌ 0'dan büyük bir sayı girin:")
-        return SETTING_ADD_COUNT
+        return SETTING_MSG_COUNT
 
     state.stop_events[str(chat_id)] = asyncio.Event()
-    task = asyncio.create_task(add_members_task(update.message, count, chat_id))
+    task = asyncio.create_task(send_messages_task(update.message, count, chat_id))
     state.operations[str(chat_id)] = task
 
     await update.message.reply_text(
-        f"🚀 Üye ekleme başlatılıyor... ({count} kişi)\n"
+        f"🚀 Mesaj gönderme başlatılıyor... ({count} kişi)\n"
         "İşlem arka planda devam edecek."
     )
     return ConversationHandler.END
 
 
-async def stop_add_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_messaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Bu botu kullanma yetkiniz yok.")
         return ConversationHandler.END
     if state.request_stop(update.effective_chat.id):
         await update.message.reply_text(
-            "⏹ Durdurma isteği alındı. İşlem güvenli noktada duracak ve eklenen üye sayısı raporlanacak."
+            "⏹ Durdurma isteği alındı. İşlem güvenli noktada duracak ve rapor gönderilecek."
         )
     else:
-        await update.message.reply_text("ℹ️ Bu sohbette devam eden bir üye ekleme işlemi yok.")
+        await update.message.reply_text("ℹ️ Devam eden bir mesaj gönderme işlemi yok.")
     return ConversationHandler.END
 
 
@@ -724,7 +692,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_client(session_data):
-    """Create and connect a Telethon client from session data."""
     client = TelegramClient(
         StringSession(session_data["session_string"]),
         API_ID, API_HASH
@@ -736,7 +703,6 @@ async def get_client(session_data):
 
 
 async def resolve_group(client, group_link):
-    """Resolve a group link to entity."""
     link = group_link.strip()
     if link.startswith("https://t.me/"):
         link = "@" + link.split("https://t.me/")[1].split("/")[0]
@@ -760,7 +726,6 @@ async def resolve_group(client, group_link):
 
 
 async def scan_group_members(message, scan_type="messages"):
-    """Scan group for members or message senders."""
     try:
         session_data = state.sessions[0]
         client = await get_client(session_data)
@@ -786,13 +751,10 @@ async def scan_group_members(message, scan_type="messages"):
             async for msg in client.iter_messages(group, limit=10000):
                 msg_count += 1
                 sender = msg.sender
-                # Channel posts and service messages can expose a Channel/Chat
-                # sender; only Telegram User entities have a meaningful bot flag.
                 if isinstance(sender, types.User) and sender.username and not sender.bot:
                     users.add(sender.username)
                 if len(users) >= MAX_USERS:
                     break
-                # Progress update every 1000 messages
                 if msg_count % 1000 == 0:
                     try:
                         await message.edit_text(f"🔍 Mesaj atanlar taranıyor... {len(users)} kullanıcı bulundu ({msg_count} mesaj tarandı)")
@@ -804,16 +766,16 @@ async def scan_group_members(message, scan_type="messages"):
 
         await client.disconnect()
 
-        already_added = [u for u in users if u in state.added_users]
-        available = [u for u in users if u not in state.added_users]
+        already_messaged = [u for u in users if u in state.messaged_users]
+        available = [u for u in users if u not in state.messaged_users]
 
         scan_type_text = "Tüm Üyeler" if scan_type == "members" else "Mesaj Atanlar"
         await message.edit_text(
             f"✅ <b>Tarama Tamamlandı!</b>\n\n"
             f"📋 Tarama Türü: {scan_type_text}\n"
             f"👥 Toplam Benzersiz Kullanıcı: {len(users)}\n"
-            f"✅ Daha Önce Eklenmiş: {len(already_added)}\n"
-            f"⏳ Eklenebilir: {len(available)}\n\n"
+            f"✅ Daha Önce Mesaj Gönderilmiş: {len(already_messaged)}\n"
+            f"⏳ Mesaj Gönderilebilir: {len(available)}\n\n"
             f"/start ile menüye dön.",
             parse_mode="HTML"
         )
@@ -822,36 +784,32 @@ async def scan_group_members(message, scan_type="messages"):
         await message.edit_text(f"❌ Tarama hatası: {str(e)}\n\n/start ile menüye dön.")
 
 
-async def add_members_task(message, count, chat_id):
-    """Add members to target group using round-robin account rotation.
-    Each account adds 1 user, then switches to next account.
-    60 second delay between each add to prevent Telegram ban."""
-    # The caller reserves this flag before create_task(); keep it true until
-    # the final cleanup block so duplicate requests are rejected immediately.
+async def send_messages_task(message, count, chat_id):
+    """Send messages to scanned users using round-robin account rotation."""
     report = {
         "total_requested": count,
-        "added": 0,
-        "skipped_already_added": 0,
+        "sent": 0,
+        "skipped_already_messaged": 0,
         "errors": 0,
-        "banned_accounts": [],
-        "added_usernames": [],
+        "error_accounts": [],
+        "sent_usernames": [],
         "failed_usernames": [],
         "stopped": False,
         "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
-    available_users = [u for u in state.config["scanned_users"] if u not in state.added_users]
+    available_users = [u for u in state.config["scanned_users"] if u not in state.messaged_users]
 
     if not available_users:
-        await message.reply_text("❌ Eklenebilir kullanıcı kalmadı.\n\n/start ile menüye dön.")
+        await message.reply_text("❌ Mesaj gönderilebilir kullanıcı kalmadı.\n\n/start ile menüye dön.")
         state.release_operation(chat_id)
         return
 
     target_count = min(count, len(available_users))
-    users_to_add = available_users[:target_count]
+    users_to_message = available_users[:target_count]
+    msg_text = state.config.get("message_text", "")
 
-    # Connect only accounts that are not temporarily disabled. An account that
-    # cannot connect is isolated instead of aborting the complete operation.
+    # Connect accounts
     clients = []
     active_sessions = []
     now = time.time()
@@ -871,58 +829,33 @@ async def add_members_task(message, count, chat_id):
         state.release_operation(chat_id)
         return
 
-    # Resolve the target independently for each account. A forbidden or
-    # otherwise unusable account must not prevent the remaining accounts from
-    # continuing.
-    target_groups = []
-    valid_clients = []
-    valid_sessions = []
-    for c, session_data in zip(clients, active_sessions):
-        try:
-            target_groups.append(await resolve_group(c, state.config["target_group"]))
-            valid_clients.append(c)
-            valid_sessions.append(session_data)
-        except Exception as exc:
-            phone = session_data.get("phone", "unknown")
-            print(f"Target resolution error ({phone}): {exc}")
-            session_data["disabled_until"] = time.time() + 3600
-            report["banned_accounts"].append(phone)
-            try:
-                await c.disconnect()
-            except Exception:
-                pass
-    clients, active_sessions = valid_clients, valid_sessions
-    if not clients:
-        await message.reply_text("❌ Hiçbir hesap hedef gruba erişemiyor. Hesap izinlerini kontrol edin.\n\n/start ile menüye dön.")
-        state.release_operation(chat_id)
-        return
-
     num_accounts = len(clients)
     disabled_indices = set()
 
     await message.reply_text(
-        f"🚀 <b>Üye ekleme başladı!</b>\n\n"
+        f"🚀 <b>Mesaj gönderme başladı!</b>\n\n"
         f"📱 Aktif Hesap Sayısı: {num_accounts}\n"
         f"🔄 Mod: Sırayla 1'er 1'er (round-robin)\n"
         f"🎯 Hedef: {target_count} kişi\n"
-        f"⏱ Her ekleme arası: 60 saniye\n"
+        f"⏱ Her mesaj arası: 60 saniye\n"
         f"⏱ Tahmini süre: ~{target_count} dakika",
         parse_mode="HTML"
     )
 
     try:
-        rotation_idx = 0  # Round-robin index
+        rotation_idx = 0
 
-        for i, username in enumerate(users_to_add):
-            if not state.is_operation_running(chat_id):
+        for i, username in enumerate(users_to_message):
+            if state.is_stop_requested(chat_id):
+                report["stopped"] = True
                 break
 
-            # Check if already added
-            if username in state.added_users:
-                report["skipped_already_added"] += 1
+            # Skip already messaged
+            if username in state.messaged_users:
+                report["skipped_already_messaged"] += 1
                 continue
 
-            # Find next available (non-banned) account
+            # Find next available account
             attempts = 0
             while rotation_idx % num_accounts in disabled_indices and attempts < num_accounts:
                 rotation_idx += 1
@@ -934,36 +867,33 @@ async def add_members_task(message, count, chat_id):
 
             current_idx = rotation_idx % num_accounts
             client = clients[current_idx]
-            target_group = target_groups[current_idx]
 
             try:
-                # Add by username
+                # Get user entity and send message
                 user_entity = await client.get_entity(f"@{username}")
-                await client(functions.channels.InviteToChannelRequest(
-                    channel=target_group,
-                    users=[user_entity]
-                ))
+                await client.send_message(user_entity, msg_text)
 
-                state.added_users.append(username)
-                state.save_added_users()
-                report["added"] += 1
-                report["added_usernames"].append(username)
+                state.messaged_users.append(username)
+                state.save_messaged_users()
+                report["sent"] += 1
+                report["sent_usernames"].append(username)
 
                 # Progress update every 10 users
-                if report["added"] % 10 == 0:
+                if report["sent"] % 10 == 0:
                     active_count = num_accounts - len(disabled_indices)
                     await message.reply_text(
-                        f"📊 İlerleme: {report['added']}/{target_count}\n"
+                        f"📊 İlerleme: {report['sent']}/{target_count}\n"
                         f"📱 Aktif Hesap: {active_sessions[current_idx]['phone']}\n"
                         f"🔄 Kullanılabilir Hesap: {active_count}/{num_accounts}"
                     )
 
             except (errors.UserPrivacyRestrictedError,
-                    errors.UserNotMutualContactError,
-                    errors.UserChannelsTooMuchError,
                     errors.InputUserDeactivatedError) as e:
                 report["errors"] += 1
                 report["failed_usernames"].append(f"@{username}: {type(e).__name__}")
+                # Bu kullanıcıya bir daha mesaj atılmasın
+                state.messaged_users.append(username)
+                state.save_messaged_users()
                 rotation_idx += 1
                 continue
 
@@ -975,17 +905,16 @@ async def add_members_task(message, count, chat_id):
                 if e.seconds > 300:
                     disabled_indices.add(current_idx)
                     active_sessions[current_idx]["disabled_until"] = time.time() + max(e.seconds, 300)
-                    report["banned_accounts"].append(active_sessions[current_idx]['phone'])
+                    report["error_accounts"].append(active_sessions[current_idx]['phone'])
                     state.save_sessions()
                 else:
                     await asyncio.sleep(e.seconds)
 
-            except (errors.PeerFloodError, errors.UserBannedInChannelError,
-                    errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError) as e:
+            except (errors.PeerFloodError, errors.ChatWriteForbiddenError) as e:
                 error_name = type(e).__name__
                 disabled_indices.add(current_idx)
                 active_sessions[current_idx]["disabled_until"] = time.time() + 3600
-                report["banned_accounts"].append(active_sessions[current_idx]['phone'])
+                report["error_accounts"].append(active_sessions[current_idx]['phone'])
                 state.save_sessions()
                 await message.reply_text(
                     f"⚠️ <b>{active_sessions[current_idx]['phone']}</b> hata aldı! ({error_name})\n"
@@ -996,20 +925,22 @@ async def add_members_task(message, count, chat_id):
             except Exception as e:
                 error_name = type(e).__name__
                 error_str = str(e).lower()
-                if "ban" in error_str or "restrict" in error_str or "flood" in error_str or "peer" in error_name.lower():
+                if "ban" in error_str or "restrict" in error_str or "flood" in error_str:
                     disabled_indices.add(current_idx)
                     active_sessions[current_idx]["disabled_until"] = time.time() + 3600
-                    report["banned_accounts"].append(active_sessions[current_idx]['phone'])
+                    report["error_accounts"].append(active_sessions[current_idx]['phone'])
                     state.save_sessions()
                 else:
                     report["errors"] += 1
                     report["failed_usernames"].append(f"@{username}: {error_name}")
-                    await message.reply_text(f"⚠️ @{username} eklenemedi ({error_name}); diğer hesapla devam ediliyor.")
+                    # Bu kullanıcıya bir daha mesaj atılmasın
+                    state.messaged_users.append(username)
+                    state.save_messaged_users()
 
-            # Move to next account (round-robin)
+            # Move to next account
             rotation_idx += 1
 
-            # Wait up to 60 seconds, but wake immediately when the user stops.
+            # Wait 60 seconds, but wake immediately on stop
             try:
                 await asyncio.wait_for(state.stop_events[str(chat_id)].wait(), timeout=60)
                 report["stopped"] = True
@@ -1028,35 +959,36 @@ async def add_members_task(message, count, chat_id):
                 pass
         report["stopped"] = report["stopped"] or state.is_stop_requested(chat_id)
         state.release_operation(chat_id)
+
     # Final report
     report["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     report_text = (
-        f"📊 <b>İŞLEM RAPORU</b>\n"
+        f"📊 <b>MESAJ GÖNDERME RAPORU</b>\n"
         f"{'═' * 30}\n\n"
         f"⏱ Başlangıç: {report['start_time']}\n"
         f"⏱ Bitiş: {report['end_time']}\n"
         f"📌 Durum: {'⏹ Durduruldu' if report['stopped'] else '✅ Tamamlandı'}\n\n"
         f"📋 <b>Özet:</b>\n"
         f"• İstenen: {report['total_requested']} kişi\n"
-        f"• ✅ Başarıyla Eklenen: {report['added']} kişi\n"
-        f"• ⏭ Atlanan (daha önce eklenmiş): {report['skipped_already_added']} kişi\n"
+        f"• ✅ Başarıyla Gönderilen: {report['sent']} kişi\n"
+        f"• ⏭ Atlanan (daha önce gönderilmiş): {report['skipped_already_messaged']} kişi\n"
         f"• ❌ Hatalı: {report['errors']} kişi\n"
-        f"• 🚫 Ban/Hata Alan Hesaplar: {len(report['banned_accounts'])}\n\n"
+        f"• 🚫 Hata Alan Hesaplar: {len(report['error_accounts'])}\n\n"
     )
 
-    if report["banned_accounts"]:
-        report_text += f"🚫 <b>Ban/Hata Alan Hesaplar:</b>\n"
-        for acc in report["banned_accounts"]:
+    if report["error_accounts"]:
+        report_text += f"🚫 <b>Hata Alan Hesaplar:</b>\n"
+        for acc in report["error_accounts"]:
             report_text += f"  • {acc}\n"
         report_text += "\n"
 
-    if report["added_usernames"][:20]:
-        report_text += f"✅ <b>Eklenen Kullanıcılar (ilk 20):</b>\n"
-        for u in report["added_usernames"][:20]:
+    if report["sent_usernames"][:20]:
+        report_text += f"✅ <b>Mesaj Gönderilen (ilk 20):</b>\n"
+        for u in report["sent_usernames"][:20]:
             report_text += f"  • @{u}\n"
-        if len(report["added_usernames"]) > 20:
-            report_text += f"  ... ve {len(report['added_usernames']) - 20} kişi daha\n"
+        if len(report["sent_usernames"]) > 20:
+            report_text += f"  ... ve {len(report['sent_usernames']) - 20} kişi daha\n"
         report_text += "\n"
 
     if report["failed_usernames"][:10]:
@@ -1070,8 +1002,7 @@ async def add_members_task(message, count, chat_id):
     await message.reply_text(report_text, parse_mode="HTML")
 
 
-def run_bot_polling():
-    """Run bot with manual async setup to avoid signal handler issues."""
+def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -1080,8 +1011,7 @@ def run_bot_polling():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            CommandHandler("hesaplar", list_accounts_command),
-            CommandHandler("durdur", stop_add_members),
+            CommandHandler("durdur", stop_messaging),
             CallbackQueryHandler(button_handler),
         ],
         states={
@@ -1089,8 +1019,8 @@ def run_bot_polling():
             ADDING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_code)],
             ADDING_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_2fa)],
             SETTING_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_source)],
-            SETTING_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_target)],
-            SETTING_ADD_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_add_count)],
+            SETTING_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_message)],
+            SETTING_MSG_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_msg_count)],
         },
         fallbacks=[CommandHandler("iptal", cancel)],
         allow_reentry=True,
@@ -1112,7 +1042,6 @@ def run_bot_polling():
             drop_pending_updates=True,
         )
         print(f"🤖 Bot başlatıldı! Webhook: {webhook_url}")
-        # Keep running
         while True:
             await asyncio.sleep(3600)
 
@@ -1129,20 +1058,16 @@ def main():
     if not API_ID or not API_HASH:
         print("HATA: API_ID ve API_HASH ayarlanmamış!")
         return
-    if not ADMIN_ID:
-        print("HATA: ADMIN_ID ayarlanmamış!")
-        return
 
     print(f"🤖 Bot başlatılıyor...")
     print(f"📱 Admin ID: {ADMIN_ID}")
     print(f"🔑 API ID: {API_ID}")
 
-    # Start Flask in a separate thread for health check
+    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"🌐 Health check server started on port {PORT}")
 
-    # Wait for Flask to bind port
     time.sleep(2)
 
     # Start keep-alive thread
@@ -1150,8 +1075,8 @@ def main():
     keep_alive_thread.start()
     print("💓 Keep-alive started (10 min interval)")
 
-    # Run bot in main thread (using manual async, no signal handlers)
-    run_bot_polling()
+    # Run bot
+    run_bot()
 
 
 if __name__ == "__main__":
