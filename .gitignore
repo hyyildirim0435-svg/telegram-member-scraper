@@ -1,7 +1,6 @@
 .env
 sessions.json
-added_users.json
-config.json
+sessions.local.json
 __pycache__/
 *.pyc
 *.session
