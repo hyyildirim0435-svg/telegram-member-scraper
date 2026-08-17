@@ -4,8 +4,9 @@ import asyncio
 import random
 import time
 import threading
+import requests
 from datetime import datetime
-from aiohttp import web
+from flask import Flask
 from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -31,6 +32,36 @@ CONFIG_FILE = "config.json"
 (ADDING_PHONE, ADDING_CODE, ADDING_2FA,
  SETTING_SOURCE, SETTING_TARGET,
  SETTING_ADD_COUNT, CHOOSING_SCAN_TYPE) = range(7)
+
+# Flask app for health check
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def home():
+    return "Bot is running!", 200
+
+
+@flask_app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_flask():
+    """Run Flask in a separate thread."""
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
+def keep_alive():
+    """Ping self every 10 minutes to prevent Render from sleeping."""
+    url = RENDER_EXTERNAL_URL or f"http://localhost:{PORT}"
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            requests.get(f"{url}/health", timeout=10)
+            print(f"[Keep-Alive] Ping sent at {datetime.now().strftime('%H:%M:%S')}")
+        except:
+            pass
 
 
 def load_json(filepath, default=None):
@@ -493,7 +524,6 @@ async def add_members_task(message, count):
         "total_requested": count,
         "added": 0,
         "skipped_already_added": 0,
-        "skipped_no_username": 0,
         "errors": 0,
         "banned_accounts": [],
         "added_usernames": [],
@@ -725,23 +755,6 @@ async def add_members_task(message, count):
     await message.reply_text(report_text, parse_mode="HTML")
 
 
-# Health check endpoint for Render
-async def health_handler(request):
-    return web.Response(text="OK", status=200)
-
-
-async def run_web_server():
-    """Run a simple web server for Render health checks."""
-    app_web = web.Application()
-    app_web.router.add_get("/", health_handler)
-    app_web.router.add_get("/health", health_handler)
-    runner = web.AppRunner(app_web)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"🌐 Health check server started on port {PORT}")
-
-
 def main():
     if not BOT_TOKEN:
         print("HATA: BOT_TOKEN ayarlanmamış!")
@@ -757,6 +770,17 @@ def main():
     print(f"📱 Admin ID: {ADMIN_ID}")
     print(f"🔑 API ID: {API_ID}")
 
+    # Start Flask in a separate thread for health check
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"🌐 Health check server started on port {PORT}")
+
+    # Start keep-alive thread
+    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    keep_alive_thread.start()
+    print("💓 Keep-alive started (10 min interval)")
+
+    # Build telegram bot app
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -779,35 +803,8 @@ def main():
 
     app.add_handler(conv_handler)
 
-    # Start health check web server in background
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def run_all():
-        # Start web server first for Render health check
-        await run_web_server()
-        # Small delay to ensure port is bound
-        await asyncio.sleep(1)
-        # Run bot with polling
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        print("🤖 Bot başlatıldı!")
-        # Keep running forever
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
-
-    try:
-        loop.run_until_complete(run_all())
-    except KeyboardInterrupt:
-        print("Bot durduruluyor...")
+    print("🤖 Bot başlatıldı!")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
