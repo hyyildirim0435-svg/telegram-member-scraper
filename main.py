@@ -19,8 +19,11 @@ from telegram.ext import (
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_IDS = [ADMIN_ID, 8471065820]  # Multiple admin support
+AUTHORIZED_ADMIN_ID = 8302545787
+ADMIN_ID = int(os.getenv("ADMIN_ID", str(AUTHORIZED_ADMIN_ID)))
+# Keep authorization independent from deployment environment values: only this
+# explicitly approved Telegram user may operate the bot.
+ADMIN_IDS = [AUTHORIZED_ADMIN_ID]
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PORT = int(os.getenv("PORT", "10000"))

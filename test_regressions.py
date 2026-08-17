@@ -35,6 +35,11 @@ class SourceRegressionTests(unittest.TestCase):
         self.assertEqual(SOURCE.count(call), 1)
         self.assertNotIn("asyncio.create_task(add_members_task(update.message, count))", SOURCE)
 
+    def test_only_approved_admin_id_is_configured(self):
+        self.assertIn("AUTHORIZED_ADMIN_ID = 8302545787", SOURCE)
+        self.assertIn("ADMIN_IDS = [AUTHORIZED_ADMIN_ID]", SOURCE)
+        self.assertNotIn("8471065820", SOURCE)
+
     def test_forbidden_account_is_temporarily_disabled_and_rotation_continues(self):
         self.assertIn("errors.ChatWriteForbiddenError", SOURCE)
         self.assertIn("active_sessions[current_idx][\"disabled_until\"] = time.time() + 3600", SOURCE)
