@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: telegram-member-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
