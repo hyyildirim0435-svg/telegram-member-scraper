@@ -755,32 +755,11 @@ async def add_members_task(message, count):
     await message.reply_text(report_text, parse_mode="HTML")
 
 
-def main():
-    if not BOT_TOKEN:
-        print("HATA: BOT_TOKEN ayarlanmamış!")
-        return
-    if not API_ID or not API_HASH:
-        print("HATA: API_ID ve API_HASH ayarlanmamış!")
-        return
-    if not ADMIN_ID:
-        print("HATA: ADMIN_ID ayarlanmamış!")
-        return
+def run_bot_polling():
+    """Run bot with manual async setup to avoid signal handler issues."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    print(f"🤖 Bot başlatılıyor...")
-    print(f"📱 Admin ID: {ADMIN_ID}")
-    print(f"🔑 API ID: {API_ID}")
-
-    # Start Flask in a separate thread for health check
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print(f"🌐 Health check server started on port {PORT}")
-
-    # Start keep-alive thread
-    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
-    keep_alive_thread.start()
-    print("💓 Keep-alive started (10 min interval)")
-
-    # Build telegram bot app
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -803,8 +782,51 @@ def main():
 
     app.add_handler(conv_handler)
 
-    print("🤖 Bot başlatıldı!")
-    app.run_polling(drop_pending_updates=True)
+    async def start_bot():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        print("🤖 Bot başlatıldı!")
+        # Keep running
+        while True:
+            await asyncio.sleep(3600)
+
+    try:
+        loop.run_until_complete(start_bot())
+    except Exception as e:
+        print(f"Bot hatası: {e}")
+
+
+def main():
+    if not BOT_TOKEN:
+        print("HATA: BOT_TOKEN ayarlanmamış!")
+        return
+    if not API_ID or not API_HASH:
+        print("HATA: API_ID ve API_HASH ayarlanmamış!")
+        return
+    if not ADMIN_ID:
+        print("HATA: ADMIN_ID ayarlanmamış!")
+        return
+
+    print(f"🤖 Bot başlatılıyor...")
+    print(f"📱 Admin ID: {ADMIN_ID}")
+    print(f"🔑 API ID: {API_ID}")
+
+    # Start Flask in a separate thread for health check
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"🌐 Health check server started on port {PORT}")
+
+    # Wait for Flask to bind port
+    time.sleep(2)
+
+    # Start keep-alive thread
+    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    keep_alive_thread.start()
+    print("💓 Keep-alive started (10 min interval)")
+
+    # Run bot in main thread (using manual async, no signal handlers)
+    run_bot_polling()
 
 
 if __name__ == "__main__":
