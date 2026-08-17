@@ -62,6 +62,12 @@ class SourceRegressionTests(unittest.TestCase):
         self.assertIn("removed = state.sessions.pop(index)", SOURCE)
         self.assertIn("state.save_sessions()", SOURCE)
 
+    def test_webhook_delivery_avoids_polling_conflict(self):
+        self.assertIn("@flask_app.route(\"/telegram/webhook\", methods=[\"POST\"])", SOURCE)
+        self.assertIn("await app.bot.set_webhook(", SOURCE)
+        self.assertIn("drop_pending_updates=True", SOURCE)
+        self.assertNotIn("start_polling", SOURCE)
+
     def test_message_scan_accepts_only_user_senders(self):
         self.assertIn("sender = msg.sender", SOURCE)
         self.assertIn("isinstance(sender, types.User)", SOURCE)

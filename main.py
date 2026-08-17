@@ -8,7 +8,7 @@ import time
 import threading
 import requests
 from datetime import datetime
-from flask import Flask
+from flask import Flask, request
 from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
 from cryptography.fernet import Fernet, InvalidToken
@@ -28,7 +28,8 @@ ADMIN_IDS = [AUTHORIZED_ADMIN_ID]
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PORT = int(os.getenv("PORT", "10000"))
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://telegram-member-scraper.onrender.com")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "hyyildirim0435-svg/telegram-member-scraper")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
@@ -63,6 +64,8 @@ CONFIG_FILE = "config.json"
 
 # Flask app for health check
 flask_app = Flask(__name__)
+BOT_LOOP = None
+BOT_APPLICATION = None
 
 
 @flask_app.route("/")
@@ -73,6 +76,27 @@ def home():
 @flask_app.route("/health")
 def health():
     return "OK", 200
+
+
+@flask_app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    if TELEGRAM_WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        return "Forbidden", 403
+    if BOT_LOOP is None or BOT_APPLICATION is None:
+        return "Bot is starting", 503
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return "Invalid update", 400
+    try:
+        update = Update.de_json(payload, BOT_APPLICATION.bot)
+        future = asyncio.run_coroutine_threadsafe(
+            BOT_APPLICATION.process_update(update), BOT_LOOP
+        )
+        future.result(timeout=20)
+        return "OK", 200
+    except Exception as exc:
+        print(f"Webhook update error: {type(exc).__name__}: {exc}")
+        return "Update processing failed", 500
 
 
 def run_flask():
@@ -1076,12 +1100,18 @@ def run_bot_polling():
     app.add_handler(conv_handler)
 
     async def start_bot():
+        global BOT_LOOP, BOT_APPLICATION
+        BOT_LOOP = loop
+        BOT_APPLICATION = app
         await app.initialize()
         await app.start()
-        # Ensure this deployment owns update delivery and starts from a clean queue.
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        await app.updater.start_polling(drop_pending_updates=True)
-        print("🤖 Bot başlatıldı!")
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/telegram/webhook"
+        await app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=TELEGRAM_WEBHOOK_SECRET or None,
+            drop_pending_updates=True,
+        )
+        print(f"🤖 Bot başlatıldı! Webhook: {webhook_url}")
         # Keep running
         while True:
             await asyncio.sleep(3600)
