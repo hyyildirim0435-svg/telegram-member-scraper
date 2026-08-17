@@ -555,17 +555,31 @@ async def scan_group_members(message, scan_type="messages"):
         group = await resolve_group(client, state.config["source_group"])
         users = set()
 
+        MAX_USERS = 2000
+
         if scan_type == "members":
-            await message.edit_text("🔍 Tüm üyeler taranıyor...")
+            await message.edit_text("🔍 Tüm üyeler taranıyor... (max 2000)")
             async for user in client.iter_participants(group):
                 if user.username and not user.bot:
                     users.add(user.username)
+                if len(users) >= MAX_USERS:
+                    break
         else:
-            await message.edit_text("🔍 Mesaj atanlar taranıyor...")
-            async for msg in client.iter_messages(group, limit=None):
+            await message.edit_text("🔍 Mesaj atanlar taranıyor... (max 2000)")
+            msg_count = 0
+            async for msg in client.iter_messages(group, limit=10000):
+                msg_count += 1
                 if msg.sender and hasattr(msg.sender, 'username'):
                     if msg.sender.username and not msg.sender.bot:
                         users.add(msg.sender.username)
+                if len(users) >= MAX_USERS:
+                    break
+                # Progress update every 1000 messages
+                if msg_count % 1000 == 0:
+                    try:
+                        await message.edit_text(f"🔍 Mesaj atanlar taranıyor... {len(users)} kullanıcı bulundu ({msg_count} mesaj tarandı)")
+                    except:
+                        pass
 
         state.config["scanned_users"] = list(users)
         state.save_config()
