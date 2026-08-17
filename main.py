@@ -3,7 +3,9 @@ import json
 import asyncio
 import random
 import time
+import threading
 from datetime import datetime
+from aiohttp import web
 from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,6 +19,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
+PORT = int(os.getenv("PORT", "10000"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 # Data files
 SESSIONS_FILE = "sessions.json"
@@ -50,8 +54,8 @@ def is_admin(user_id):
 
 class BotState:
     def __init__(self):
-        self.sessions = load_json(SESSIONS_FILE, [])  # list of {phone, session_string}
-        self.added_users = load_json(ADDED_USERS_FILE, [])  # list of usernames
+        self.sessions = load_json(SESSIONS_FILE, [])
+        self.added_users = load_json(ADDED_USERS_FILE, [])
         self.config = load_json(CONFIG_FILE, {
             "source_group": "",
             "target_group": "",
@@ -419,15 +423,17 @@ async def resolve_group(client, group_link):
     elif link.startswith("t.me/"):
         link = "@" + link.split("t.me/")[1].split("/")[0]
 
-    if link.startswith("+") or "joinchat" in group_link:
-        # Private group invite link
+    if "+" in group_link or "joinchat" in group_link:
         hash_part = group_link.split("/")[-1].replace("+", "")
         try:
-            result = await client(functions.messages.CheckChatInviteRequest(hash=hash_part))
-            if hasattr(result, 'chat'):
-                return result.chat
+            await client(functions.messages.ImportChatInviteRequest(hash=hash_part))
+        except errors.UserAlreadyParticipantError:
+            pass
         except:
             pass
+        result = await client(functions.messages.CheckChatInviteRequest(hash=hash_part))
+        if hasattr(result, 'chat'):
+            return result.chat
 
     entity = await client.get_entity(link)
     return entity
@@ -481,7 +487,7 @@ async def scan_group_members(message, scan_type="messages"):
 
 
 async def add_members_task(message, count):
-    """Add members to target group using multiple accounts."""
+    """Add members to target group using multiple accounts with username."""
     state.is_running = True
     report = {
         "total_requested": count,
@@ -536,6 +542,7 @@ async def add_members_task(message, count):
                 continue
 
             try:
+                # Add by username
                 user_entity = await client.get_entity(f"@{username}")
                 await client(functions.channels.InviteToChannelRequest(
                     channel=target_group,
@@ -558,41 +565,51 @@ async def add_members_task(message, count):
                 delay = random.randint(30, 60)
                 await asyncio.sleep(delay)
 
-            except (errors.UserBannedInChannelError, errors.ChatWriteForbiddenError,
-                    errors.UserPrivacyRestrictedError) as e:
+            except (errors.UserPrivacyRestrictedError,
+                    errors.UserNotMutualContactError,
+                    errors.UserChannelsTooMuchError,
+                    errors.InputUserDeactivatedError) as e:
                 report["errors"] += 1
                 report["failed_usernames"].append(f"@{username}: {type(e).__name__}")
                 continue
 
-            except (errors.FloodWaitError) as e:
+            except errors.FloodWaitError as e:
                 await message.reply_text(
                     f"⚠️ Flood hatası! {e.seconds} saniye bekleniyor...\n"
                     f"📱 Hesap: {state.sessions[current_account_idx]['phone']}"
                 )
-                await asyncio.sleep(e.seconds)
-                # Retry this user
-                try:
-                    user_entity = await client.get_entity(f"@{username}")
-                    await client(functions.channels.InviteToChannelRequest(
-                        channel=target_group,
-                        users=[user_entity]
-                    ))
-                    state.added_users.append(username)
-                    state.save_added_users()
-                    report["added"] += 1
-                    report["added_usernames"].append(username)
-                except:
-                    report["errors"] += 1
-                    report["failed_usernames"].append(f"@{username}: FloodRetryFailed")
+                if e.seconds > 300:
+                    # Too long, switch account
+                    report["banned_accounts"].append(state.sessions[current_account_idx]['phone'])
+                    await client.disconnect()
+                    current_account_idx += 1
+                    if current_account_idx >= len(state.sessions):
+                        await message.reply_text("❌ Tüm hesaplar tükendi!")
+                        break
+                    await message.reply_text(
+                        f"🔄 <b>{state.sessions[current_account_idx]['phone']}</b> hesabından devam ediliyor...",
+                        parse_mode="HTML"
+                    )
+                    client = await get_client(state.sessions[current_account_idx])
+                    if client:
+                        target_group = await resolve_group(client, state.config["target_group"])
+                else:
+                    await asyncio.sleep(e.seconds)
 
-            except (errors.UserNotMutualContactError, errors.InputUserDeactivatedError,
-                    errors.PeerFloodError, errors.UserChannelsTooMuchError) as e:
-
-                # Account might be restricted, switch to next
+            except (errors.PeerFloodError, errors.UserBannedInChannelError,
+                    errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError) as e:
+                # Account restricted/banned, switch to next
+                error_name = type(e).__name__
                 report["banned_accounts"].append(state.sessions[current_account_idx]['phone'])
-                await client.disconnect()
 
+                await message.reply_text(
+                    f"⚠️ <b>{state.sessions[current_account_idx]['phone']}</b> hesabı hata aldı! ({error_name})\n",
+                    parse_mode="HTML"
+                )
+
+                await client.disconnect()
                 current_account_idx += 1
+
                 if current_account_idx >= len(state.sessions):
                     await message.reply_text(
                         "❌ Tüm hesaplar tükendi/ban yedi! İşlem durduruluyor."
@@ -600,7 +617,6 @@ async def add_members_task(message, count):
                     break
 
                 await message.reply_text(
-                    f"⚠️ <b>{state.sessions[current_account_idx - 1]['phone']}</b> hesabı hata aldı!\n"
                     f"🔄 <b>{state.sessions[current_account_idx]['phone']}</b> hesabından devam ediliyor...",
                     parse_mode="HTML"
                 )
@@ -613,7 +629,8 @@ async def add_members_task(message, count):
                         break
                     client = await get_client(state.sessions[current_account_idx])
 
-                target_group = await resolve_group(client, state.config["target_group"])
+                if client:
+                    target_group = await resolve_group(client, state.config["target_group"])
 
                 # Retry current user with new account
                 try:
@@ -630,36 +647,17 @@ async def add_members_task(message, count):
                     report["errors"] += 1
                     report["failed_usernames"].append(f"@{username}: SwitchRetryFailed")
 
-            except errors.ChatAdminRequiredError:
-                await message.reply_text(
-                    f"❌ <b>{state.sessions[current_account_idx]['phone']}</b> hesabının hedef grupta admin yetkisi yok!\n"
-                    f"🔄 Sonraki hesaba geçiliyor...",
-                    parse_mode="HTML"
-                )
-                report["banned_accounts"].append(state.sessions[current_account_idx]['phone'])
-                await client.disconnect()
-
-                current_account_idx += 1
-                if current_account_idx >= len(state.sessions):
-                    await message.reply_text("❌ Tüm hesaplar tükendi!")
-                    break
-
-                client = await get_client(state.sessions[current_account_idx])
-                if client:
-                    target_group = await resolve_group(client, state.config["target_group"])
-
             except Exception as e:
                 error_name = type(e).__name__
-                # Check if it's a ban-like error
-                if "ban" in str(e).lower() or "restrict" in str(e).lower() or "Peer" in error_name:
+                error_str = str(e).lower()
+
+                if "ban" in error_str or "restrict" in error_str or "flood" in error_str or "peer" in error_name.lower():
                     report["banned_accounts"].append(state.sessions[current_account_idx]['phone'])
                     await client.disconnect()
 
                     current_account_idx += 1
                     if current_account_idx >= len(state.sessions):
-                        await message.reply_text(
-                            f"❌ Tüm hesaplar tükendi! Son hata: {error_name}"
-                        )
+                        await message.reply_text(f"❌ Tüm hesaplar tükendi! Son hata: {error_name}")
                         break
 
                     await message.reply_text(
@@ -699,11 +697,11 @@ async def add_members_task(message, count):
         f"• ✅ Başarıyla Eklenen: {report['added']} kişi\n"
         f"• ⏭ Atlanan (daha önce eklenmiş): {report['skipped_already_added']} kişi\n"
         f"• ❌ Hatalı: {report['errors']} kişi\n"
-        f"• 🚫 Ban Yiyen Hesaplar: {len(report['banned_accounts'])}\n\n"
+        f"• 🚫 Ban/Hata Alan Hesaplar: {len(report['banned_accounts'])}\n\n"
     )
 
     if report["banned_accounts"]:
-        report_text += f"🚫 <b>Ban Yiyen Hesaplar:</b>\n"
+        report_text += f"🚫 <b>Ban/Hata Alan Hesaplar:</b>\n"
         for acc in report["banned_accounts"]:
             report_text += f"  • {acc}\n"
         report_text += "\n"
@@ -727,6 +725,23 @@ async def add_members_task(message, count):
     await message.reply_text(report_text, parse_mode="HTML")
 
 
+# Health check endpoint for Render
+async def health_handler(request):
+    return web.Response(text="OK", status=200)
+
+
+async def run_web_server():
+    """Run a simple web server for Render health checks."""
+    app_web = web.Application()
+    app_web.router.add_get("/", health_handler)
+    app_web.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"🌐 Health check server started on port {PORT}")
+
+
 def main():
     if not BOT_TOKEN:
         print("HATA: BOT_TOKEN ayarlanmamış!")
@@ -737,6 +752,10 @@ def main():
     if not ADMIN_ID:
         print("HATA: ADMIN_ID ayarlanmamış!")
         return
+
+    print(f"🤖 Bot başlatılıyor...")
+    print(f"📱 Admin ID: {ADMIN_ID}")
+    print(f"🔑 API ID: {API_ID}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -759,8 +778,25 @@ def main():
 
     app.add_handler(conv_handler)
 
-    print("🤖 Bot başlatıldı!")
-    app.run_polling(drop_pending_updates=True)
+    # Start health check web server in background
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def run_all():
+        await run_web_server()
+        # Run bot with polling
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        print("🤖 Bot başlatıldı!")
+        # Keep running
+        while True:
+            await asyncio.sleep(3600)
+
+    try:
+        loop.run_until_complete(run_all())
+    except KeyboardInterrupt:
+        print("Bot durduruluyor...")
 
 
 if __name__ == "__main__":
