@@ -1,4 +1,5 @@
 import os
+import os
 import json
 import base64
 import asyncio
@@ -170,6 +171,7 @@ class BotState:
         self.temp_client = None
         self.temp_phone_hash = None
         self.is_running = False
+        self.operation_task = None
 
     def save_sessions(self):
         save_json(SESSIONS_FILE, self.sessions)
@@ -488,9 +490,19 @@ async def set_add_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Geçerli bir sayı girin:")
         return SETTING_ADD_COUNT
 
-    if state.is_running:
+    # Reserve the operation before yielding to the event loop. This closes the
+    # check-then-create race caused by rapid duplicate commands/callbacks.
+    if state.is_running or (state.operation_task and not state.operation_task.done()):
         await update.message.reply_text("⚠️ Zaten bir işlem devam ediyor.\n\n/start ile menüye dön.")
         return ConversationHandler.END
+
+    if count <= 0:
+        await update.message.reply_text("❌ 0'dan büyük bir sayı girin:")
+        return SETTING_ADD_COUNT
+
+    state.is_running = True
+    task = asyncio.create_task(add_members_task(update.message, count))
+    state.operation_task = task
 
     await update.message.reply_text(
         f"🚀 Üye ekleme başlatılıyor... ({count} kişi)\n"
@@ -609,7 +621,8 @@ async def add_members_task(message, count):
     """Add members to target group using round-robin account rotation.
     Each account adds 1 user, then switches to next account.
     60 second delay between each add to prevent Telegram ban."""
-    state.is_running = True
+    # The caller reserves this flag before create_task(); keep it true until
+    # the final cleanup block so duplicate requests are rejected immediately.
     report = {
         "total_requested": count,
         "added": 0,
@@ -631,41 +644,55 @@ async def add_members_task(message, count):
     target_count = min(count, len(available_users))
     users_to_add = available_users[:target_count]
 
-    # Connect all available accounts
+    # Connect only accounts that are not temporarily disabled. An account that
+    # cannot connect is isolated instead of aborting the complete operation.
     clients = []
     active_sessions = []
-    for idx, session_data in enumerate(state.sessions):
+    now = time.time()
+    for session_data in state.sessions:
+        if float(session_data.get("disabled_until", 0) or 0) > now:
+            continue
         try:
             c = await get_client(session_data)
             if c:
                 clients.append(c)
                 active_sessions.append(session_data)
-        except:
-            pass
+        except Exception as exc:
+            print(f"Account connection error ({session_data.get('phone', 'unknown')}): {exc}")
 
     if not clients:
         await message.reply_text("❌ Hiçbir hesap bağlanamadı.\n\n/start ile menüye dön.")
         state.is_running = False
         return
 
-    # Resolve target group with first client
-    try:
-        target_groups = []
-        for c in clients:
-            tg = await resolve_group(c, state.config["target_group"])
-            target_groups.append(tg)
-    except Exception as e:
-        await message.reply_text(f"❌ Hedef grup çözülemedi: {str(e)}\n\n/start ile menüye dön.")
-        for c in clients:
+    # Resolve the target independently for each account. A forbidden or
+    # otherwise unusable account must not prevent the remaining accounts from
+    # continuing.
+    target_groups = []
+    valid_clients = []
+    valid_sessions = []
+    for c, session_data in zip(clients, active_sessions):
+        try:
+            target_groups.append(await resolve_group(c, state.config["target_group"]))
+            valid_clients.append(c)
+            valid_sessions.append(session_data)
+        except Exception as exc:
+            phone = session_data.get("phone", "unknown")
+            print(f"Target resolution error ({phone}): {exc}")
+            session_data["disabled_until"] = time.time() + 3600
+            report["banned_accounts"].append(phone)
             try:
                 await c.disconnect()
-            except:
+            except Exception:
                 pass
+    clients, active_sessions = valid_clients, valid_sessions
+    if not clients:
+        await message.reply_text("❌ Hiçbir hesap hedef gruba erişemiyor. Hesap izinlerini kontrol edin.\n\n/start ile menüye dön.")
         state.is_running = False
         return
 
     num_accounts = len(clients)
-    banned_indices = set()
+    disabled_indices = set()
 
     await message.reply_text(
         f"🚀 <b>Üye ekleme başladı!</b>\n\n"
@@ -691,12 +718,12 @@ async def add_members_task(message, count):
 
             # Find next available (non-banned) account
             attempts = 0
-            while rotation_idx % num_accounts in banned_indices and attempts < num_accounts:
+            while rotation_idx % num_accounts in disabled_indices and attempts < num_accounts:
                 rotation_idx += 1
                 attempts += 1
 
             if attempts >= num_accounts:
-                await message.reply_text("❌ Tüm hesaplar ban yedi! İşlem durduruluyor.")
+                await message.reply_text("❌ Kullanılabilir hesap kalmadı! İşlem durduruluyor.")
                 break
 
             current_idx = rotation_idx % num_accounts
@@ -718,7 +745,7 @@ async def add_members_task(message, count):
 
                 # Progress update every 10 users
                 if report["added"] % 10 == 0:
-                    active_count = num_accounts - len(banned_indices)
+                    active_count = num_accounts - len(disabled_indices)
                     await message.reply_text(
                         f"📊 İlerleme: {report['added']}/{target_count}\n"
                         f"📱 Aktif Hesap: {active_sessions[current_idx]['phone']}\n"
@@ -740,16 +767,20 @@ async def add_members_task(message, count):
                     f"⏱ {e.seconds} saniye bekleme gerekiyor."
                 )
                 if e.seconds > 300:
-                    banned_indices.add(current_idx)
+                    disabled_indices.add(current_idx)
+                    active_sessions[current_idx]["disabled_until"] = time.time() + max(e.seconds, 300)
                     report["banned_accounts"].append(active_sessions[current_idx]['phone'])
+                    state.save_sessions()
                 else:
                     await asyncio.sleep(e.seconds)
 
             except (errors.PeerFloodError, errors.UserBannedInChannelError,
                     errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError) as e:
                 error_name = type(e).__name__
-                banned_indices.add(current_idx)
+                disabled_indices.add(current_idx)
+                active_sessions[current_idx]["disabled_until"] = time.time() + 3600
                 report["banned_accounts"].append(active_sessions[current_idx]['phone'])
+                state.save_sessions()
                 await message.reply_text(
                     f"⚠️ <b>{active_sessions[current_idx]['phone']}</b> hata aldı! ({error_name})\n"
                     f"🔄 Kalan hesaplarla devam ediliyor...",
@@ -760,11 +791,14 @@ async def add_members_task(message, count):
                 error_name = type(e).__name__
                 error_str = str(e).lower()
                 if "ban" in error_str or "restrict" in error_str or "flood" in error_str or "peer" in error_name.lower():
-                    banned_indices.add(current_idx)
+                    disabled_indices.add(current_idx)
+                    active_sessions[current_idx]["disabled_until"] = time.time() + 3600
                     report["banned_accounts"].append(active_sessions[current_idx]['phone'])
+                    state.save_sessions()
                 else:
                     report["errors"] += 1
                     report["failed_usernames"].append(f"@{username}: {error_name}")
+                    await message.reply_text(f"⚠️ @{username} eklenemedi ({error_name}); diğer hesapla devam ediliyor.")
 
             # Move to next account (round-robin)
             rotation_idx += 1
@@ -782,6 +816,7 @@ async def add_members_task(message, count):
             except:
                 pass
         state.is_running = False
+        state.operation_task = None
 
     # Final report
     report["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
