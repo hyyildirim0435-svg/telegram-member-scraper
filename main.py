@@ -170,8 +170,16 @@ class BotState:
         self.temp_phone = None
         self.temp_client = None
         self.temp_phone_hash = None
-        self.is_running = False
-        self.operation_task = None
+        # Each chat has an independent background operation. Keys are strings so
+        # the mapping remains safe if it is later persisted or logged as JSON.
+        self.operations = {}
+
+    def is_operation_running(self, chat_id):
+        task = self.operations.get(str(chat_id))
+        return bool(task and not task.done())
+
+    def release_operation(self, chat_id):
+        self.operations.pop(str(chat_id), None)
 
     def save_sessions(self):
         save_json(SESSIONS_FILE, self.sessions)
@@ -336,7 +344,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Taranan Kullanıcı: {len(state.config.get('scanned_users', []))}\n"
             f"✅ Başarıyla Eklenen: {len(state.added_users)}\n"
             f"⏳ Eklenebilir: {len(available)}\n"
-            f"🔄 İşlem Durumu: {'Çalışıyor' if state.is_running else 'Boşta'}\n"
+            f"🔄 İşlem Durumu: {'Çalışıyor' if state.is_operation_running(query.message.chat_id) else 'Boşta'}\n"
             f"\n/start ile menüye dön."
         )
         await query.message.edit_text(text, parse_mode="HTML")
@@ -490,9 +498,11 @@ async def set_add_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Geçerli bir sayı girin:")
         return SETTING_ADD_COUNT
 
-    # Reserve the operation before yielding to the event loop. This closes the
-    # check-then-create race caused by rapid duplicate commands/callbacks.
-    if state.is_running or (state.operation_task and not state.operation_task.done()):
+    chat_id = update.effective_chat.id
+
+    # Reserve per chat before yielding to the event loop. A second request from
+    # the same chat is rejected, while another chat can run independently.
+    if state.is_operation_running(chat_id):
         await update.message.reply_text("⚠️ Zaten bir işlem devam ediyor.\n\n/start ile menüye dön.")
         return ConversationHandler.END
 
@@ -500,15 +510,13 @@ async def set_add_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 0'dan büyük bir sayı girin:")
         return SETTING_ADD_COUNT
 
-    state.is_running = True
-    task = asyncio.create_task(add_members_task(update.message, count))
-    state.operation_task = task
+    task = asyncio.create_task(add_members_task(update.message, count, chat_id))
+    state.operations[str(chat_id)] = task
 
     await update.message.reply_text(
         f"🚀 Üye ekleme başlatılıyor... ({count} kişi)\n"
         "İşlem arka planda devam edecek."
     )
-    asyncio.create_task(add_members_task(update.message, count))
     return ConversationHandler.END
 
 
@@ -617,7 +625,7 @@ async def scan_group_members(message, scan_type="messages"):
         await message.edit_text(f"❌ Tarama hatası: {str(e)}\n\n/start ile menüye dön.")
 
 
-async def add_members_task(message, count):
+async def add_members_task(message, count, chat_id):
     """Add members to target group using round-robin account rotation.
     Each account adds 1 user, then switches to next account.
     60 second delay between each add to prevent Telegram ban."""
@@ -638,7 +646,7 @@ async def add_members_task(message, count):
 
     if not available_users:
         await message.reply_text("❌ Eklenebilir kullanıcı kalmadı.\n\n/start ile menüye dön.")
-        state.is_running = False
+        state.release_operation(chat_id)
         return
 
     target_count = min(count, len(available_users))
@@ -662,7 +670,7 @@ async def add_members_task(message, count):
 
     if not clients:
         await message.reply_text("❌ Hiçbir hesap bağlanamadı.\n\n/start ile menüye dön.")
-        state.is_running = False
+        state.release_operation(chat_id)
         return
 
     # Resolve the target independently for each account. A forbidden or
@@ -688,7 +696,7 @@ async def add_members_task(message, count):
     clients, active_sessions = valid_clients, valid_sessions
     if not clients:
         await message.reply_text("❌ Hiçbir hesap hedef gruba erişemiyor. Hesap izinlerini kontrol edin.\n\n/start ile menüye dön.")
-        state.is_running = False
+        state.release_operation(chat_id)
         return
 
     num_accounts = len(clients)
@@ -708,7 +716,7 @@ async def add_members_task(message, count):
         rotation_idx = 0  # Round-robin index
 
         for i, username in enumerate(users_to_add):
-            if not state.is_running:
+            if not state.is_operation_running(chat_id):
                 break
 
             # Check if already added
@@ -815,8 +823,7 @@ async def add_members_task(message, count):
                 await c.disconnect()
             except:
                 pass
-        state.is_running = False
-        state.operation_task = None
+        state.release_operation(chat_id)
 
     # Final report
     report["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
