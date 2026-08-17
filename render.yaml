@@ -21,3 +21,5 @@ services:
         value: main
       - key: SESSIONS_JSON
         sync: false
+      - key: SESSION_ENCRYPTION_KEY
+        sync: false

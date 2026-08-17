@@ -47,9 +47,31 @@ class SourceRegressionTests(unittest.TestCase):
         self.assertIn("Kalan hesaplarla devam ediliyor", SOURCE)
         self.assertNotIn("banned_indices", SOURCE)
 
+    def test_persistent_encrypted_session_backup_is_configured(self):
+        self.assertIn("SESSION_ENCRYPTION_KEY = os.getenv(\"SESSION_ENCRYPTION_KEY\", \"\")", SOURCE)
+        self.assertIn("SESSION_BACKUP_FILE = \"sessions.enc\"", SOURCE)
+        self.assertIn("Fernet(SESSION_ENCRYPTION_KEY.encode(\"utf-8\"))", SOURCE)
+        self.assertIn("save_encrypted_sessions(self.sessions)", SOURCE)
+
+    def test_account_listing_and_deletion_are_available(self):
+        self.assertIn("async def list_accounts_command", SOURCE)
+        self.assertIn("callback_data=f\"delete_account:{i}\"", SOURCE)
+        self.assertIn("elif data.startswith(\"delete_account:\")", SOURCE)
+        self.assertIn("removed = state.sessions.pop(index)", SOURCE)
+        self.assertIn("state.save_sessions()", SOURCE)
+
+    def test_stop_operation_is_scoped_to_chat_and_reports_count(self):
+        self.assertIn("self.stop_events = {}", SOURCE)
+        self.assertIn("def request_stop(self, chat_id):", SOURCE)
+        self.assertIn("state.stop_events[str(chat_id)] = asyncio.Event()", SOURCE)
+        self.assertIn("callback_data=\"stop_add\"", SOURCE)
+        self.assertIn("CommandHandler(\"durdur\", stop_add_members)", SOURCE)
+        self.assertIn('report[\"stopped\"] = True', SOURCE)
+        self.assertIn("Başarıyla Eklenen: {report['added']} kişi", SOURCE)
+
     def test_cleanup_releases_only_the_own_chat_operation(self):
         self.assertIn("state.release_operation(chat_id)", SOURCE)
-        self.assertIn("self.operations.pop(str(chat_id), None)", SOURCE)
+        self.assertIn("self.operations.pop(key, None)", SOURCE)
 
     def test_independent_operation_map_semantics(self):
         operations = {"100": FakeTask(), "200": FakeTask()}

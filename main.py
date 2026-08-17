@@ -11,6 +11,7 @@ from datetime import datetime
 from flask import Flask
 from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
+from cryptography.fernet import Fernet, InvalidToken
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -33,6 +34,9 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "hyyildirim0435-svg/telegram-member-scrap
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 # Telethon StringSession values are secrets and must not be committed to GitHub.
 SESSIONS_JSON = os.getenv("SESSIONS_JSON", "")
+# Session strings are encrypted before being persisted to the GitHub backup.
+SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "")
+SESSION_BACKUP_FILE = "sessions.enc"
 
 _persistence_lock = threading.Lock()
 
@@ -127,15 +131,75 @@ def save_to_github(filepath, data):
         print(f"GitHub save error for {filepath}: {exc}")
 
 
+def load_encrypted_sessions():
+    """Load encrypted Telegram sessions from the durable GitHub backup."""
+    if not GITHUB_TOKEN or not SESSION_ENCRYPTION_KEY:
+        return None
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{SESSION_BACKUP_FILE}"
+        response = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=15)
+        if response.status_code != 200:
+            return None
+        encoded = response.json().get("content", "").replace("\n", "")
+        encrypted = base64.b64decode(encoded)
+        decrypted = Fernet(SESSION_ENCRYPTION_KEY.encode("utf-8")).decrypt(encrypted)
+        data = json.loads(decrypted.decode("utf-8"))
+        return data if isinstance(data, list) else None
+    except InvalidToken:
+        print("Encrypted session backup cannot be decrypted; falling back to SESSIONS_JSON/local data.")
+        return None
+    except Exception as exc:
+        print(f"Encrypted session load error: {exc}")
+        return None
+
+
+def save_encrypted_sessions(data):
+    """Persist session strings as an encrypted GitHub Contents file."""
+    if not GITHUB_TOKEN or not SESSION_ENCRYPTION_KEY:
+        print("Session backup skipped: GITHUB_TOKEN or SESSION_ENCRYPTION_KEY is missing.")
+        return
+    try:
+        encrypted = Fernet(SESSION_ENCRYPTION_KEY.encode("utf-8")).encrypt(
+            json.dumps(data, ensure_ascii=False).encode("utf-8")
+        )
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{SESSION_BACKUP_FILE}"
+        content = base64.b64encode(encrypted).decode("ascii")
+        with _persistence_lock:
+            current = requests.get(
+                url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=15
+            )
+            payload = {
+                "message": "Update encrypted Telegram sessions",
+                "content": content,
+                "branch": GITHUB_BRANCH,
+            }
+            if current.status_code == 200:
+                payload["sha"] = current.json().get("sha")
+            response = requests.put(url, headers=_github_headers(), json=payload, timeout=20)
+            if response.status_code not in (200, 201):
+                print(f"Encrypted session save error: {response.status_code} {response.text[:300]}")
+    except Exception as exc:
+        print(f"Encrypted session save error: {exc}")
+
+
 def load_json(filepath, default=None):
     if default is None:
         default = {}
-    # Session strings are secrets; use an environment secret instead of GitHub.
-    if filepath == SESSIONS_FILE and SESSIONS_JSON:
-        try:
-            return json.loads(SESSIONS_JSON)
-        except json.JSONDecodeError:
-            print("SESSIONS_JSON is not valid JSON; falling back to local sessions file.")
+    if filepath == SESSIONS_FILE:
+        encrypted_sessions = load_encrypted_sessions()
+        if encrypted_sessions is not None:
+            try:
+                with open(filepath, "w") as f:
+                    json.dump(encrypted_sessions, f, indent=2, ensure_ascii=False)
+            except OSError:
+                pass
+            return encrypted_sessions
+        # Bootstrap from the Render secret when no encrypted backup exists yet.
+        if SESSIONS_JSON:
+            try:
+                return json.loads(SESSIONS_JSON)
+            except json.JSONDecodeError:
+                print("SESSIONS_JSON is not valid JSON; falling back to local sessions file.")
     remote_data = load_from_github(filepath)
     if remote_data is not None:
         try:
@@ -164,6 +228,10 @@ def is_admin(user_id):
 class BotState:
     def __init__(self):
         self.sessions = load_json(SESSIONS_FILE, [])
+        # Bootstrap the durable encrypted backup from the existing Render secret
+        # on the first startup after this feature is deployed.
+        if self.sessions and SESSION_ENCRYPTION_KEY and not load_encrypted_sessions():
+            save_encrypted_sessions(self.sessions)
         self.added_users = load_json(ADDED_USERS_FILE, [])
         self.config = load_json(CONFIG_FILE, {
             "source_group": "",
@@ -176,16 +244,32 @@ class BotState:
         # Each chat has an independent background operation. Keys are strings so
         # the mapping remains safe if it is later persisted or logged as JSON.
         self.operations = {}
+        self.stop_events = {}
 
     def is_operation_running(self, chat_id):
         task = self.operations.get(str(chat_id))
         return bool(task and not task.done())
 
     def release_operation(self, chat_id):
-        self.operations.pop(str(chat_id), None)
+        key = str(chat_id)
+        self.operations.pop(key, None)
+        self.stop_events.pop(key, None)
+
+    def request_stop(self, chat_id):
+        event = self.stop_events.get(str(chat_id))
+        if not event or not self.is_operation_running(chat_id):
+            return False
+        event.set()
+        return True
+
+    def is_stop_requested(self, chat_id):
+        event = self.stop_events.get(str(chat_id))
+        return bool(event and event.is_set())
 
     def save_sessions(self):
-        save_json(SESSIONS_FILE, self.sessions)
+        with open(SESSIONS_FILE, "w") as f:
+            json.dump(self.sessions, f, indent=2, ensure_ascii=False)
+        save_encrypted_sessions(self.sessions)
 
     def save_added_users(self):
         save_json(ADDED_USERS_FILE, self.added_users)
@@ -204,11 +288,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton("📱 Hesap Ekle", callback_data="add_account")],
-        [InlineKeyboardButton("📋 Hesapları Listele", callback_data="list_accounts")],
+        [InlineKeyboardButton("📋 Hesapları Listele / Sil", callback_data="list_accounts")],
         [InlineKeyboardButton("🔗 Kaynak Grup Ayarla", callback_data="set_source")],
         [InlineKeyboardButton("🎯 Hedef Grup Ayarla", callback_data="set_target")],
         [InlineKeyboardButton("🔍 Tarama Başlat", callback_data="scan_start")],
         [InlineKeyboardButton("➕ Üye Eklemeyi Başlat", callback_data="start_adding")],
+        [InlineKeyboardButton("⏹ Üye Eklemeyi Durdur", callback_data="stop_add")],
         [InlineKeyboardButton("📊 Durum", callback_data="status")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -227,6 +312,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
+    return ConversationHandler.END
+
+
+async def list_accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Bu botu kullanma yetkiniz yok.")
+        return ConversationHandler.END
+    if not state.sessions:
+        await update.message.reply_text("📋 Kayıtlı hesap yok.\n\n/start ile menüye dön.")
+        return ConversationHandler.END
+    text = "📋 <b>Kayıtlı Hesaplar</b>\n\nSilmek istediğiniz hesabın düğmesine basın:\n"
+    keyboard = []
+    for i, session_data in enumerate(state.sessions):
+        phone = session_data.get("phone", f"Hesap {i + 1}")
+        text += f"{i + 1}. {phone}\n"
+        keyboard.append([InlineKeyboardButton(f"🗑 {i + 1}. {phone} hesabını sil", callback_data=f"delete_account:{i}")])
+    keyboard.append([InlineKeyboardButton("🔙 Geri", callback_data="back_menu")])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -250,16 +353,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ADDING_PHONE
 
-    elif data == "list_accounts":
+    elif data in ("list_accounts", "delete_account"):
         if not state.sessions:
             await query.message.edit_text("📋 Kayıtlı hesap yok.\n\n/start ile menüye dön.")
             return ConversationHandler.END
 
-        text = "📋 <b>Kayıtlı Hesaplar:</b>\n\n"
-        for i, s in enumerate(state.sessions, 1):
-            text += f"{i}. {s['phone']}\n"
-        text += "\n/start ile menüye dön."
-        await query.message.edit_text(text, parse_mode="HTML")
+        text = "📋 <b>Kayıtlı Hesaplar</b>\n\nSilmek istediğiniz hesabın düğmesine basın:\n"
+        keyboard = []
+        for i, session_data in enumerate(state.sessions):
+            phone = session_data.get("phone", f"Hesap {i + 1}")
+            text += f"{i + 1}. {phone}\n"
+            keyboard.append([InlineKeyboardButton(f"🗑 {i + 1}. {phone} hesabını sil", callback_data=f"delete_account:{i}")])
+        keyboard.append([InlineKeyboardButton("🔙 Geri", callback_data="back_menu")])
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return ConversationHandler.END
+
+    elif data.startswith("delete_account:"):
+        try:
+            index = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await query.message.edit_text("❌ Geçersiz hesap seçimi.\n\n/start ile menüye dön.")
+            return ConversationHandler.END
+
+        if index < 0 or index >= len(state.sessions):
+            await query.message.edit_text("⚠️ Bu hesap artık mevcut değil.\n\n/start ile menüye dön.")
+            return ConversationHandler.END
+
+        removed = state.sessions.pop(index)
+        state.save_sessions()
+        await query.message.edit_text(
+            f"✅ <b>{removed.get('phone', 'Telegram hesabı')}</b> silindi.\n"
+            f"📱 Kalan hesap: {len(state.sessions)}\n\n/start ile menüye dön.",
+            parse_mode="HTML"
+        )
+        return ConversationHandler.END
+
+    elif data == "stop_add":
+        if state.request_stop(query.message.chat_id):
+            await query.message.edit_text(
+                "⏹ <b>Durdurma isteği alındı.</b>\\n\\n"
+                "Mevcut Telegram isteği güvenli şekilde tamamlandıktan sonra işlem duracak ve rapor gönderilecek.",
+                parse_mode="HTML"
+            )
+        else:
+            await query.message.edit_text("ℹ️ Bu sohbette devam eden bir üye ekleme işlemi yok.\\n\\n/start ile menüye dön.")
         return ConversationHandler.END
 
     elif data == "set_source":
@@ -513,6 +650,7 @@ async def set_add_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 0'dan büyük bir sayı girin:")
         return SETTING_ADD_COUNT
 
+    state.stop_events[str(chat_id)] = asyncio.Event()
     task = asyncio.create_task(add_members_task(update.message, count, chat_id))
     state.operations[str(chat_id)] = task
 
@@ -520,6 +658,19 @@ async def set_add_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚀 Üye ekleme başlatılıyor... ({count} kişi)\n"
         "İşlem arka planda devam edecek."
     )
+    return ConversationHandler.END
+
+
+async def stop_add_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Bu botu kullanma yetkiniz yok.")
+        return ConversationHandler.END
+    if state.request_stop(update.effective_chat.id):
+        await update.message.reply_text(
+            "⏹ Durdurma isteği alındı. İşlem güvenli noktada duracak ve eklenen üye sayısı raporlanacak."
+        )
+    else:
+        await update.message.reply_text("ℹ️ Bu sohbette devam eden bir üye ekleme işlemi yok.")
     return ConversationHandler.END
 
 
@@ -642,6 +793,7 @@ async def add_members_task(message, count, chat_id):
         "banned_accounts": [],
         "added_usernames": [],
         "failed_usernames": [],
+        "stopped": False,
         "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -814,8 +966,13 @@ async def add_members_task(message, count, chat_id):
             # Move to next account (round-robin)
             rotation_idx += 1
 
-            # 60 second delay between each add
-            await asyncio.sleep(60)
+            # Wait up to 60 seconds, but wake immediately when the user stops.
+            try:
+                await asyncio.wait_for(state.stop_events[str(chat_id)].wait(), timeout=60)
+                report["stopped"] = True
+                break
+            except asyncio.TimeoutError:
+                pass
 
     except Exception as e:
         await message.reply_text(f"❌ Kritik hata: {str(e)}")
@@ -826,8 +983,8 @@ async def add_members_task(message, count, chat_id):
                 await c.disconnect()
             except:
                 pass
+        report["stopped"] = report["stopped"] or state.is_stop_requested(chat_id)
         state.release_operation(chat_id)
-
     # Final report
     report["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -835,7 +992,8 @@ async def add_members_task(message, count, chat_id):
         f"📊 <b>İŞLEM RAPORU</b>\n"
         f"{'═' * 30}\n\n"
         f"⏱ Başlangıç: {report['start_time']}\n"
-        f"⏱ Bitiş: {report['end_time']}\n\n"
+        f"⏱ Bitiş: {report['end_time']}\n"
+        f"📌 Durum: {'⏹ Durduruldu' if report['stopped'] else '✅ Tamamlandı'}\n\n"
         f"📋 <b>Özet:</b>\n"
         f"• İstenen: {report['total_requested']} kişi\n"
         f"• ✅ Başarıyla Eklenen: {report['added']} kişi\n"
@@ -879,6 +1037,8 @@ def run_bot_polling():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("hesaplar", list_accounts_command),
+            CommandHandler("durdur", stop_add_members),
             CallbackQueryHandler(button_handler),
         ],
         states={
