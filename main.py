@@ -1076,6 +1076,8 @@ def run_bot_polling():
     async def start_bot():
         await app.initialize()
         await app.start()
+        # Ensure this deployment owns update delivery and starts from a clean queue.
+        await app.bot.delete_webhook(drop_pending_updates=True)
         await app.updater.start_polling(drop_pending_updates=True)
         print("🤖 Bot başlatıldı!")
         # Keep running
