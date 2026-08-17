@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import asyncio
 import random
 import time
@@ -22,6 +23,13 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "hyyildirim0435-svg/telegram-member-scraper")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+# Telethon StringSession values are secrets and must not be committed to GitHub.
+SESSIONS_JSON = os.getenv("SESSIONS_JSON", "")
+
+_persistence_lock = threading.Lock()
 
 # Data files
 SESSIONS_FILE = "sessions.json"
@@ -64,9 +72,73 @@ def keep_alive():
             pass
 
 
+def _github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def load_from_github(filepath):
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filepath}"
+        response = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=15)
+        if response.status_code != 200:
+            return None
+        encoded = response.json().get("content", "").replace("\\n", "")
+        return json.loads(base64.b64decode(encoded).decode("utf-8"))
+    except Exception as exc:
+        print(f"GitHub load error for {filepath}: {exc}")
+        return None
+
+
+def save_to_github(filepath, data):
+    """Persist non-secret JSON state in the repository."""
+    if not GITHUB_TOKEN or filepath == SESSIONS_FILE:
+        return
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filepath}"
+        content = base64.b64encode(
+            json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        with _persistence_lock:
+            current = requests.get(
+                url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=15
+            )
+            payload = {
+                "message": f"Update {filepath}",
+                "content": content,
+                "branch": GITHUB_BRANCH,
+            }
+            if current.status_code == 200:
+                payload["sha"] = current.json().get("sha")
+            response = requests.put(url, headers=_github_headers(), json=payload, timeout=20)
+            if response.status_code not in (200, 201):
+                print(f"GitHub save error for {filepath}: {response.status_code} {response.text[:300]}")
+    except Exception as exc:
+        print(f"GitHub save error for {filepath}: {exc}")
+
+
 def load_json(filepath, default=None):
     if default is None:
         default = {}
+    # Session strings are secrets; use an environment secret instead of GitHub.
+    if filepath == SESSIONS_FILE and SESSIONS_JSON:
+        try:
+            return json.loads(SESSIONS_JSON)
+        except json.JSONDecodeError:
+            print("SESSIONS_JSON is not valid JSON; falling back to local sessions file.")
+    remote_data = load_from_github(filepath)
+    if remote_data is not None:
+        try:
+            with open(filepath, "w") as f:
+                json.dump(remote_data, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+        return remote_data
     try:
         with open(filepath, "r") as f:
             return json.load(f)
@@ -77,6 +149,7 @@ def load_json(filepath, default=None):
 def save_json(filepath, data):
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    save_to_github(filepath, data)
 
 
 def is_admin(user_id):
