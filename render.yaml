@@ -2,24 +2,23 @@ services:
   - type: web
     name: telegram-member-scraper
     runtime: docker
+    plan: free
+    region: frankfurt
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /health
+    dockerContext: .
+    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
-        sync: false
-      - key: ADMIN_ID
         sync: false
       - key: API_ID
         sync: false
       - key: API_HASH
         sync: false
-      - key: GITHUB_TOKEN
+      - key: ADMIN_ID
         sync: false
-      - key: GITHUB_REPO
-        value: hyyildirim0435-svg/telegram-member-scraper
-      - key: GITHUB_BRANCH
-        value: main
-      - key: SESSIONS_JSON
-        sync: false
-      - key: SESSION_ENCRYPTION_KEY
-        sync: false
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: telegram-bot-data
+      mountPath: /var/data
+      sizeGB: 1

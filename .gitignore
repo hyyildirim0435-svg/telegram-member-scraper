@@ -1,6 +1,9 @@
 .env
-sessions.json
-sessions.local.json
+.env.*
+!.env.example
 __pycache__/
 *.pyc
+data/
+*.sqlite3
 *.session
+*.session-journal

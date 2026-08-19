@@ -1,61 +1,34 @@
-# Telegram Üye Çekme Botu
+# Telegram Otomatik Duyuru Botu
 
-Telegram gruplarından üye çekip başka bir gruba ekleyen bot.
+Bu bot, admin onaylı kullanıcıların Telegram Client API ile hesap eklemesini, grupları içe aktarmasını, tekil grup bağlantısı eklemesini, duyuru metni ve gönderim sıklığı ayarlamasını sağlar. Duyurular, eklenen kullanıcı hesabı üzerinden kayıtlı gruplara gönderilir.
 
 ## Özellikler
 
-- 📱 Birden fazla Telegram hesabı ekleme (numara + kod + 2FA)
-- 👥 Gruptaki tüm üyeleri çekme
-- 💬 Grupta mesaj atan benzersiz kullanıcıları çekme
-- ➕ Kullanıcı adı ile hedef gruba üye ekleme
-- 🔄 Hesap ban yediğinde otomatik sonraki hesaba geçiş
-- ⏭ Daha önce eklenen üyeleri atlama
-- 📊 Detaylı işlem raporu
+- Inline keyboard tabanlı Türkçe menü.
+- Telefon, doğrulama kodu ve iki aşamalı doğrulama şifresiyle Telethon hesabı ekleme.
+- Hesaptaki grup ve megagroup dialoglarını listeleyip tümünü ekleme.
+- `t.me/...` veya davet bağlantısıyla tekil grup ekleme.
+- Grup silme, duyuru metni ayarlama/silme ve dakika bazında sıklık ayarı.
+- Yeni kullanıcıları admin onayına sunma; onay, red ve kullanıcı silme.
+- SQLite veritabanı ve Telegram session dosyaları için kalıcı disk desteği.
 
-## Kurulum
-
-### Gereksinimler
-
-- Python 3.11+
-- Telegram Bot Token (@BotFather'dan)
-- Telegram API ID ve API Hash (https://my.telegram.org)
-- Admin Telegram User ID
-
-### Yerel Kurulum
+## Çalıştırma
 
 ```bash
-git clone https://github.com/KULLANICI/telegram-member-scraper.git
-cd telegram-member-scraper
-pip install -r requirements.txt
 cp .env.example .env
-# .env dosyasını düzenleyin
+# .env dosyasını doldur
+pip install -r requirements.txt
 python main.py
 ```
 
-### Render Deploy
+## Render
 
-1. GitHub'a push edin
-2. Render Dashboard'da "New > Background Worker" seçin
-3. GitHub reposunu bağlayın
-4. Environment Variables ekleyin:
-   - `BOT_TOKEN`
-   - `ADMIN_ID`
-   - `API_ID`
-   - `API_HASH`
-5. Deploy edin
+Render üzerinde Docker web service olarak çalışır. `BOT_TOKEN`, `API_ID`, `API_HASH` ve `ADMIN_ID` gizli environment variable olarak tanımlanmalıdır. `/var/data` kalıcı diske bağlanır; SQLite veritabanı ve Telethon session dosyaları bu dizinde tutulur.
+
+## Güvenlik
+
+Bot token, API hash, API ID ve kullanıcı session dosyaları kaynak koduna yazılmamalıdır. Telegram hesabı session dosyaları kişisel erişim yetkisi taşıdığı için yalnızca kalıcı ve erişimi kısıtlı depolama alanında saklanmalıdır. Kullanıcı bu bilgiler sohbette açıklandığı için deploy sonrasında bot tokenı, GitHub tokenı ve Render API anahtarını yenilemelidir.
 
 ## Kullanım
 
-1. `/start` komutu ile botu başlatın
-2. "Hesap Ekle" ile Telegram hesaplarınızı ekleyin
-3. "Kaynak Grup Ayarla" ile üyelerin çekileceği grubu belirleyin
-4. "Hedef Grup Ayarla" ile üyelerin ekleneceği grubu belirleyin
-5. "Tarama Başlat" ile kullanıcıları tarayın (tüm üyeler veya mesaj atanlar)
-6. "Üye Eklemeyi Başlat" ile ekleme işlemini başlatın
-
-## Notlar
-
-- Her ekleme arasında 30-60 saniye bekleme süresi vardır
-- Ban yiyen hesap otomatik olarak atlanır
-- Daha önce eklenen kullanıcılar tekrar denenmez
-- İşlem sonunda detaylı rapor verilir
+Admin `/start` ile doğrudan kullanabilir. Diğer kullanıcılar ilk girişte admin onayı bekler. Onay sonrası `/start` ile menü açılır. Duyuru hesabı Telegram gruplarında mesaj gönderme yetkisine sahip olmalıdır.

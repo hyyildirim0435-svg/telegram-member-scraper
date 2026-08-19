@@ -1,5 +1,4 @@
-telethon==1.36.0
-python-telegram-bot==21.6
-flask==3.0.3
-requests==2.32.3
-cryptography==43.0.1
+python-telegram-bot[job-queue]==21.10
+Telethon==1.42.0
+cryptography==44.0.2
+python-dotenv==1.0.1
