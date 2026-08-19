@@ -103,17 +103,10 @@ async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     u = update.effective_user
     if not u:
         return False
+    # Approval is intentionally disabled. Existing user rows and statuses are preserved;
+    # all users are allowed through without notification or approval checks.
     with db() as c:
-        row = c.execute("SELECT status FROM users WHERE telegram_id=?", (u.id,)).fetchone()
-        if not row:
-            c.execute("INSERT INTO users(telegram_id, username, status) VALUES (?, ?, 'pending')", (u.id, u.username or ""))
-            await context.bot.send_message(ADMIN_ID, f"🔔 Yeni kullanıcı onayı bekliyor\nID: `{u.id}`\nKullanıcı: @{u.username or 'yok'}", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Onayla", callback_data=f"approve:{u.id}"), InlineKeyboardButton("❌ Reddet", callback_data=f"reject:{u.id}")]]))
-        elif row["status"] == "rejected":
-            await update.effective_message.reply_text("Bu kullanıcı reddedildi.")
-            return False
-    if not approved(u.id):
-        await update.effective_message.reply_text("⏳ Admin onayı bekleniyor. Onaylandığında botu kullanabilirsiniz.")
-        return False
+        c.execute("INSERT OR IGNORE INTO users(telegram_id, username, status) VALUES (?, ?, 'approved')", (u.id, getattr(u, "username", "") or ""))
     return True
 
 
