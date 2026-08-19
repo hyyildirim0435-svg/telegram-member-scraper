@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import time
 import json
 import urllib.request
 from pathlib import Path
@@ -53,11 +54,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, phone TEXT NOT NULL, session_name TEXT NOT NULL UNIQUE, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, account_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, title TEXT NOT NULL, username TEXT, invite_link TEXT, UNIQUE(user_id, chat_id));
-        CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, announcement TEXT, interval_minutes INTEGER NOT NULL DEFAULT 60, active INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, announcement TEXT, interval_minutes INTEGER NOT NULL DEFAULT 60, active INTEGER NOT NULL DEFAULT 0, last_sent_at INTEGER);
         """)
         # Existing databases are upgraded in place; no rows or session data are deleted.
         try:
             c.execute("ALTER TABLE settings ADD COLUMN active INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+        try:
+            c.execute("ALTER TABLE settings ADD COLUMN last_sent_at INTEGER")
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc).lower():
                 raise
@@ -360,14 +366,27 @@ async def toggle_announcements(q, uid):
 
 
 async def announce_job(context: ContextTypes.DEFAULT_TYPE):
-    with db() as c: settings = c.execute("SELECT user_id,announcement,interval_minutes FROM settings WHERE active=1 AND announcement IS NOT NULL AND announcement<>''").fetchall()
+    now = int(time.time())
+    with db() as c:
+        settings = c.execute("SELECT user_id,announcement,interval_minutes,last_sent_at FROM settings WHERE active=1 AND announcement IS NOT NULL AND announcement<>''").fetchall()
     for s in settings:
+        interval_seconds = max(1, int(s["interval_minutes"] or DEFAULT_INTERVAL)) * 60
+        last_sent_at = s["last_sent_at"]
+        if last_sent_at is not None and now - int(last_sent_at) < interval_seconds:
+            continue
         uid = s["user_id"]; client = await get_client(uid)
         if not client: continue
         with db() as c: groups = c.execute("SELECT chat_id,title FROM groups WHERE user_id=?", (uid,)).fetchall()
+        sent_any = False
         for g in groups:
-            try: await client.send_message(g["chat_id"], s["announcement"])
-            except Exception as e: log.warning("Send failed %s: %s", g["title"], e)
+            try:
+                await client.send_message(g["chat_id"], s["announcement"])
+                sent_any = True
+            except Exception as e:
+                log.warning("Send failed %s: %s", g["title"], e)
+        if sent_any:
+            with db() as c:
+                c.execute("UPDATE settings SET last_sent_at=? WHERE user_id=?", (now, uid))
 
 
 async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
