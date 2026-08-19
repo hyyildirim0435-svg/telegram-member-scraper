@@ -123,6 +123,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "account_add":
         await q.edit_message_text("Telefon numaranızı uluslararası formatta gönderin. Örnek: +905xxxxxxxxx", reply_markup=back_menu()); return PHONE
     elif data == "groups_import": await show_import_groups(q, uid)
+    elif data.startswith("toggle_group:"): await toggle_group(q, uid, int(data.split(":")[1]))
+    elif data == "import_selected": await import_selected(q, uid)
     elif data == "groups_delete": await show_delete_groups(q, uid)
     elif data == "group_link": await q.edit_message_text("Grup bağlantısını gönderin. Örnek: https://t.me/grupkullaniciadi veya https://t.me/+davetkodu", reply_markup=back_menu()); return GROUP_LINK
     elif data == "announcement":
@@ -200,22 +202,66 @@ async def get_client(uid: int) -> Optional[TelegramClient]:
     clients[uid] = client; return client
 
 
+group_cache: dict[int, list] = {}
+selected_cache: dict[int, set[int]] = {}
+
+
+async def render_import_menu(q, uid):
+    found = group_cache.get(uid, [])
+    selected = selected_cache.setdefault(uid, set())
+    rows = []
+    for i, (chat_id, name, _) in enumerate(found[:40]):
+        mark = "✅ " if chat_id in selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{i + 1}. {name[:35]}", callback_data=f"toggle_group:{i}")])
+    rows.append([InlineKeyboardButton("✅ Seçilenleri ekle", callback_data="import_selected"), InlineKeyboardButton("✅ Hepsini ekle", callback_data="import_all")])
+    rows.append([InlineKeyboardButton("İptal", callback_data="home")])
+    await q.edit_message_text(f"{len(found)} grup bulundu. Eklemek için gruplara dokunun. Seçili: {len(selected)}", reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def show_import_groups(q, uid):
     client = await get_client(uid)
-    if not client: await q.edit_message_text("Önce Telegram hesabı ekleyin.", reply_markup=menu()); return
+    if not client:
+        await q.edit_message_text("Önce Telegram hesabı ekleyin.", reply_markup=menu())
+        return
     found = []
     async for d in client.iter_dialogs():
         if d.is_group or (isinstance(d.entity, Channel) and getattr(d.entity, "megagroup", False)):
             found.append((d.id, d.name, getattr(d.entity, "username", None)))
-    context = q._bot.get("_application") if False else None
-    # Store a short-lived result in the global in-memory map for the callback.
     group_cache[uid] = found
-    rows = [[InlineKeyboardButton(f"{i+1}. {name[:35]}", callback_data=f"noop:{i}")] for i, (_, name, _) in enumerate(found[:40])]
-    rows.append([InlineKeyboardButton("✅ Hepsini ekle", callback_data="import_all"), InlineKeyboardButton("İptal", callback_data="home")])
-    await q.edit_message_text(f"{len(found)} grup bulundu. Hepsini eklemek için onaylayın.", reply_markup=InlineKeyboardMarkup(rows))
+    with db() as c:
+        saved = {row["chat_id"] for row in c.execute("SELECT chat_id FROM groups WHERE user_id=?", (uid,))}
+    selected_cache[uid] = set(saved)
+    await render_import_menu(q, uid)
 
 
-group_cache: dict[int, list] = {}
+async def toggle_group(q, uid, index):
+    found = group_cache.get(uid, [])
+    if index < 0 or index >= len(found):
+        await q.answer("Grup listesi yenilendi; menüyü tekrar açın.", show_alert=True)
+        return
+    chat_id, title, username = found[index]
+    selected = selected_cache.setdefault(uid, set())
+    if chat_id in selected:
+        selected.remove(chat_id)
+        with db() as c:
+            c.execute("DELETE FROM groups WHERE user_id=? AND chat_id=?", (uid, chat_id))
+        await q.answer(f"{title[:35]} çıkarıldı")
+    else:
+        selected.add(chat_id)
+        await q.answer(f"{title[:35]} seçildi")
+    await render_import_menu(q, uid)
+
+
+async def import_selected(q, uid):
+    found = group_cache.get(uid, [])
+    selected = selected_cache.get(uid, set())
+    count = 0
+    with db() as c:
+        for chat_id, title, username in found:
+            if chat_id in selected:
+                c.execute("INSERT OR IGNORE INTO groups(user_id, account_id, chat_id, title, username) SELECT ?, id, ?, ?, ? FROM accounts WHERE user_id=? ORDER BY id LIMIT 1", (uid, chat_id, title, username, uid))
+                count += 1
+    await q.edit_message_text(f"✅ {count} seçili grup eklendi.", reply_markup=menu())
 
 
 async def import_all(q, uid):
