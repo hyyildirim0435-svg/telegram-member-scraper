@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import sqlite3
+import json
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +29,9 @@ DB_PATH = DATA_DIR / "bot.sqlite3"
 SESSION_DIR = DATA_DIR / "sessions"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_INTERVAL = 60
+PORT = int(os.environ.get("PORT", "10000"))
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+health_server = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("announcement-bot")
@@ -293,7 +298,40 @@ async def announce_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e: log.warning("Send failed %s: %s", g["title"], e)
 
 
+async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        await reader.read(2048)
+        body = json.dumps({"status": "ok", "service": "telegram-announcement-bot"}).encode()
+        response = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+        writer.write(response)
+        await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def self_ping_loop():
+    # Render's own external URL is used when available. This is best-effort only;
+    # platform sleep policies can still override application-level traffic.
+    if not PUBLIC_URL:
+        log.info("PUBLIC_URL/RENDER_EXTERNAL_URL not set; self-ping disabled")
+        return
+    target = PUBLIC_URL.rstrip("/") + "/health"
+    while True:
+        try:
+            await asyncio.to_thread(lambda: urllib.request.urlopen(target, timeout=20).read())
+            log.info("Keep-alive ping OK: %s", target)
+        except Exception as exc:
+            log.warning("Keep-alive ping failed: %s", exc)
+        await asyncio.sleep(300)
+
+
 async def setup_job(application):
+    global health_server
+    health_server = await asyncio.start_server(health_handler, "0.0.0.0", PORT)
+    log.info("Health endpoint listening on port %s", PORT)
+    application.create_task(self_ping_loop(), name="self-ping-loop")
     application.job_queue.run_repeating(announce_job, interval=60, first=30, name="announcement-loop")
 
 
