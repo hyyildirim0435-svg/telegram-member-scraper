@@ -53,8 +53,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, phone TEXT NOT NULL, session_name TEXT NOT NULL UNIQUE, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, account_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, title TEXT NOT NULL, username TEXT, invite_link TEXT, UNIQUE(user_id, chat_id));
-        CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, announcement TEXT, interval_minutes INTEGER NOT NULL DEFAULT 60);
+        CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, announcement TEXT, interval_minutes INTEGER NOT NULL DEFAULT 60, active INTEGER NOT NULL DEFAULT 0);
         """)
+        # Existing databases are upgraded in place; no rows or session data are deleted.
+        try:
+            c.execute("ALTER TABLE settings ADD COLUMN active INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
         c.execute("INSERT OR IGNORE INTO users(telegram_id, status) VALUES (?, 'approved')", (ADMIN_ID,))
 
 
@@ -66,11 +72,18 @@ def approved(uid: int) -> bool:
         return bool(row and row["status"] == "approved")
 
 
-def menu():
+def menu(user_id: Optional[int] = None):
+    active = False
+    if user_id is not None:
+        with db() as c:
+            row = c.execute("SELECT active FROM settings WHERE user_id=?", (user_id,)).fetchone()
+            active = bool(row and row["active"])
+    toggle_label = "⏹ Duyuruyu durdur" if active else "▶️ Duyuruyu başlat"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Telegram hesabı ekle", callback_data="account_add"), InlineKeyboardButton("📋 Grupları getir", callback_data="groups_import")],
         [InlineKeyboardButton("🔗 Link ile grup ekle", callback_data="group_link"), InlineKeyboardButton("🗑 Grupları sil", callback_data="groups_delete")],
         [InlineKeyboardButton("📣 Duyuru mesajı", callback_data="announcement"), InlineKeyboardButton("⏱ Sıklık ayarla", callback_data="interval")],
+        [InlineKeyboardButton(toggle_label, callback_data="toggle_announcements")],
         [InlineKeyboardButton("👥 Hesaplarım", callback_data="accounts"), InlineKeyboardButton("ℹ️ Durum", callback_data="status")],
         [InlineKeyboardButton("⚙️ Kullanıcı yönetimi", callback_data="users")],
     ])
@@ -100,7 +113,7 @@ async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await ensure_user(update, context):
-        await update.message.reply_text("📣 *Telegram Otomatik Duyuru Botu*\n\nAşağıdaki menüden işlem seçin.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu())
+        await update.message.reply_text("📣 *Telegram Otomatik Duyuru Botu*\n\nAşağıdaki menüden işlem seçin.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu(update.effective_user.id))
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,7 +132,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not approved(uid):
         await q.edit_message_text("⏳ Admin onayı bekleniyor."); return
-    if data == "home": await q.edit_message_text("📣 Ana menü", reply_markup=menu())
+    if data == "home": await q.edit_message_text("📣 Ana menü", reply_markup=menu(uid))
+    elif data == "toggle_announcements": await toggle_announcements(q, uid)
     elif data == "account_add":
         await q.edit_message_text("Telefon numaranızı uluslararası formatta gönderin. Örnek: +905xxxxxxxxx", reply_markup=back_menu()); return PHONE
     elif data == "groups_import": await show_import_groups(q, uid)
@@ -133,8 +147,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Mevcut mesaj:\n\n{text}\n\nYeni mesaj için aşağıdaki butona basın.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Yeni mesaj ayarla", callback_data="announcement_set"), InlineKeyboardButton("🗑 Sil", callback_data="announcement_clear")], [InlineKeyboardButton("⬅️ Ana menü", callback_data="home")]]))
     elif data == "announcement_set": await q.edit_message_text("Duyuru metnini gönderin.", reply_markup=back_menu()); return ANNOUNCEMENT
     elif data == "announcement_clear":
-        with db() as c: c.execute("INSERT INTO settings(user_id, announcement) VALUES (?, NULL) ON CONFLICT(user_id) DO UPDATE SET announcement=NULL", (uid,))
-        await q.edit_message_text("✅ Duyuru mesajı silindi.", reply_markup=menu())
+        with db() as c: c.execute("INSERT INTO settings(user_id, announcement, active) VALUES (?, NULL, 0) ON CONFLICT(user_id) DO UPDATE SET announcement=NULL, active=0", (uid,))
+        await q.edit_message_text("✅ Duyuru mesajı silindi.", reply_markup=menu(uid))
     elif data == "interval":
         with db() as c: row = c.execute("SELECT interval_minutes FROM settings WHERE user_id=?", (uid,)).fetchone()
         current = row["interval_minutes"] if row else DEFAULT_INTERVAL
@@ -145,10 +159,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("delete_group:"):
         gid = int(data.split(":")[1])
         with db() as c: c.execute("DELETE FROM groups WHERE id=? AND user_id=?", (gid, uid))
-        await q.edit_message_text("✅ Grup silindi.", reply_markup=menu())
+        await q.edit_message_text("✅ Grup silindi.", reply_markup=menu(uid))
     elif data == "delete_all_groups":
         with db() as c: c.execute("DELETE FROM groups WHERE user_id=?", (uid,))
-        await q.edit_message_text("✅ Tüm gruplar silindi.", reply_markup=menu())
+        await q.edit_message_text("✅ Tüm gruplar silindi.", reply_markup=menu(uid))
     elif data == "import_all":
         await import_all(q, uid)
     return ConversationHandler.END
@@ -175,7 +189,7 @@ async def account_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except PhoneCodeInvalidError: await update.message.reply_text("❌ Kod geçersiz. Tekrar gönderin."); return CODE
     except Exception: await update.message.reply_text("❌ Giriş başarısız."); await client.disconnect(); return ConversationHandler.END
     await save_account(uid, context.user_data["phone"], client)
-    await update.message.reply_text("✅ Telegram hesabı eklendi.", reply_markup=menu()); return ConversationHandler.END
+    await update.message.reply_text("✅ Telegram hesabı eklendi.", reply_markup=menu(update.effective_user.id)); return ConversationHandler.END
 
 
 async def account_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,7 +197,7 @@ async def account_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await client.sign_in(password=update.message.text.strip())
     except Exception: await update.message.reply_text("❌ Şifre hatalı."); return PASSWORD
     await save_account(uid, context.user_data["phone"], client)
-    await update.message.reply_text("✅ Telegram hesabı eklendi.", reply_markup=menu()); return ConversationHandler.END
+    await update.message.reply_text("✅ Telegram hesabı eklendi.", reply_markup=menu(update.effective_user.id)); return ConversationHandler.END
 
 
 async def save_account(uid, phone, client):
@@ -261,7 +275,7 @@ async def import_selected(q, uid):
             if chat_id in selected:
                 c.execute("INSERT OR IGNORE INTO groups(user_id, account_id, chat_id, title, username) SELECT ?, id, ?, ?, ? FROM accounts WHERE user_id=? ORDER BY id LIMIT 1", (uid, chat_id, title, username, uid))
                 count += 1
-    await q.edit_message_text(f"✅ {count} seçili grup eklendi.", reply_markup=menu())
+    await q.edit_message_text(f"✅ {count} seçili grup eklendi.", reply_markup=menu(uid))
 
 
 async def import_all(q, uid):
@@ -269,7 +283,7 @@ async def import_all(q, uid):
     with db() as c:
         for chat_id, title, username in found:
             c.execute("INSERT OR IGNORE INTO groups(user_id, account_id, chat_id, title, username) SELECT ?, id, ?, ?, ? FROM accounts WHERE user_id=? ORDER BY id LIMIT 1", (uid, chat_id, title, username, uid))
-    await q.edit_message_text(f"✅ {len(found)} grup eklendi.", reply_markup=menu())
+    await q.edit_message_text(f"✅ {len(found)} grup eklendi.", reply_markup=menu(uid))
 
 
 async def show_delete_groups(q, uid):
@@ -287,21 +301,21 @@ async def group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not isinstance(entity, (Channel, Chat)): raise ValueError
         username = getattr(entity, "username", None); title = getattr(entity, "title", str(entity.id))
         with db() as c: c.execute("INSERT OR IGNORE INTO groups(user_id,account_id,chat_id,title,username) SELECT ?,id,?,?,? FROM accounts WHERE user_id=? ORDER BY id LIMIT 1", (uid, entity.id, title, username, uid))
-        await update.message.reply_text(f"✅ Grup eklendi: {title}", reply_markup=menu())
-    except Exception: await update.message.reply_text("❌ Grup bulunamadı veya hesaba erişim yok.", reply_markup=menu())
+        await update.message.reply_text(f"✅ Grup eklendi: {title}", reply_markup=menu(update.effective_user.id))
+    except Exception: await update.message.reply_text("❌ Grup bulunamadı veya hesaba erişim yok.", reply_markup=menu(update.effective_user.id))
     return ConversationHandler.END
 
 
 async def announcement(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as c: c.execute("INSERT INTO settings(user_id,announcement) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET announcement=excluded.announcement", (update.effective_user.id, update.message.text))
-    await update.message.reply_text("✅ Duyuru mesajı kaydedildi.", reply_markup=menu()); return ConversationHandler.END
+    await update.message.reply_text("✅ Duyuru mesajı kaydedildi.", reply_markup=menu(update.effective_user.id)); return ConversationHandler.END
 
 
 async def interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: minutes = int(update.message.text.strip()); assert 1 <= minutes <= 10080
     except Exception: await update.message.reply_text("1 ile 10080 arasında bir dakika değeri gönderin."); return INTERVAL
     with db() as c: c.execute("INSERT INTO settings(user_id,interval_minutes) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET interval_minutes=excluded.interval_minutes", (update.effective_user.id, minutes))
-    await update.message.reply_text(f"✅ Duyuru sıklığı {minutes} dakika olarak ayarlandı.", reply_markup=menu()); return ConversationHandler.END
+    await update.message.reply_text(f"✅ Duyuru sıklığı {minutes} dakika olarak ayarlandı.", reply_markup=menu(update.effective_user.id)); return ConversationHandler.END
 
 
 async def show_accounts(q, uid):
@@ -313,8 +327,8 @@ async def show_accounts(q, uid):
 async def show_status(q, uid):
     with db() as c:
         g = c.execute("SELECT COUNT(*) n FROM groups WHERE user_id=?", (uid,)).fetchone()["n"]
-        s = c.execute("SELECT announcement,interval_minutes FROM settings WHERE user_id=?", (uid,)).fetchone()
-    await q.edit_message_text(f"Gruplar: {g}\nDuyuru: {'ayarlı' if s and s['announcement'] else 'ayarlı değil'}\nSıklık: {s['interval_minutes'] if s else DEFAULT_INTERVAL} dakika", reply_markup=back_menu())
+        s = c.execute("SELECT announcement,interval_minutes,active FROM settings WHERE user_id=?", (uid,)).fetchone()
+    await q.edit_message_text(f"Gruplar: {g}\nDuyuru: {'ayarlı' if s and s['announcement'] else 'ayarlı değil'}\nDurum: {'aktif' if s and s['active'] else 'pasif'}\nSıklık: {s['interval_minutes'] if s else DEFAULT_INTERVAL} dakika", reply_markup=back_menu())
 
 
 async def show_users(q):
@@ -330,11 +344,23 @@ async def remove_user_callback(update, context):
     if q.from_user.id != ADMIN_ID: await q.answer(); return
     await q.answer(); uid = int(q.data.split(":")[1])
     with db() as c: c.execute("DELETE FROM users WHERE telegram_id=? AND telegram_id<>?", (uid, ADMIN_ID))
-    await q.edit_message_text("✅ Kullanıcı silindi.", reply_markup=menu())
+    await q.edit_message_text("✅ Kullanıcı silindi.", reply_markup=menu(ADMIN_ID))
+
+
+async def toggle_announcements(q, uid):
+    with db() as c:
+        row = c.execute("SELECT announcement, active FROM settings WHERE user_id=?", (uid,)).fetchone()
+        if not row or not row["announcement"]:
+            await q.edit_message_text("Önce bir duyuru mesajı ayarlayın.", reply_markup=menu(uid))
+            return
+        new_active = 0 if row["active"] else 1
+        c.execute("UPDATE settings SET active=? WHERE user_id=?", (new_active, uid))
+    label = "başlatıldı" if new_active else "durduruldu"
+    await q.edit_message_text(f"✅ Duyuru {label}.", reply_markup=menu(uid))
 
 
 async def announce_job(context: ContextTypes.DEFAULT_TYPE):
-    with db() as c: settings = c.execute("SELECT user_id,announcement,interval_minutes FROM settings WHERE announcement IS NOT NULL AND announcement<>''").fetchall()
+    with db() as c: settings = c.execute("SELECT user_id,announcement,interval_minutes FROM settings WHERE active=1 AND announcement IS NOT NULL AND announcement<>''").fetchall()
     for s in settings:
         uid = s["user_id"]; client = await get_client(uid)
         if not client: continue
