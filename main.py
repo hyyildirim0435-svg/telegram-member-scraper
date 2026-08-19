@@ -118,8 +118,14 @@ async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start is a hard reset of the conversation only; persistent database data is untouched.
+    pending_client = context.user_data.get("pending_client")
+    if pending_client and pending_client.is_connected():
+        await pending_client.disconnect()
+    context.user_data.clear()
     if await ensure_user(update, context):
-        await update.message.reply_text("📣 *Telegram Otomatik Duyuru Botu*\n\nAşağıdaki menüden işlem seçin.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu(update.effective_user.id))
+        await update.effective_message.reply_text("📣 *Telegram Otomatik Duyuru Botu*\n\nAşağıdaki menüden işlem seçin.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu(update.effective_user.id))
+    return ConversationHandler.END
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,8 +435,24 @@ async def setup_job(application):
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(setup_job).build()
-    conv = ConversationHandler(entry_points=[CallbackQueryHandler(callback, pattern="^(account_add|group_link|announcement_set|interval)$")], states={PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_phone)], CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_code)], PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_password)], ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement)], INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, interval)], GROUP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_link)]}, fallbacks=[CommandHandler("start", start)], per_user=True, per_chat=True)
-    app.add_handler(CommandHandler("start", start))
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(callback, pattern="^(account_add|group_link|announcement_set|interval)$"),
+        ],
+        states={
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_phone)],
+            CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_code)],
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, account_password)],
+            ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement)],
+            INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, interval)],
+            GROUP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_link)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        per_user=True,
+        per_chat=True,
+        allow_reentry=True,
+    )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(remove_user_callback, pattern="^remove_user:"))
     app.add_handler(CallbackQueryHandler(callback))
